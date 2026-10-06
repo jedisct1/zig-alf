@@ -22,7 +22,7 @@ const ModulusOutOfRangeError = errors.ModulusOutOfRangeError;
 const ValueOutOfRangeError = errors.ValueOutOfRangeError;
 
 /// The largest round count of any ALF-n-t variant.
-pub const max_rounds = 28;
+pub const max_rounds = mem.max(u8, mem.asBytes(&tables.rounds));
 
 /// The parameters of an ALF-n-t variant.
 pub const Shape = struct {
@@ -36,11 +36,33 @@ pub const Shape = struct {
         const bits = math.log2_int_ceil(u128, q);
         return .{ .n = @intCast(bits / 8), .t = @intCast(bits % 8) };
     }
+
+    /// Returns the number of rounds of the variant.
+    /// Asserts that `n` is at least 2.
+    pub fn rounds(shape: Shape) u8 {
+        assert(shape.n >= tables.n_min);
+        return tables.rounds[shape.n - tables.n_min][@intFromBool(shape.t != 0)];
+    }
 };
+
+/// Turns encryption round keys into decryption round keys.
+/// The result only depends on `n`, so this works for any number of rounds.
+/// Asserts `dec_round_keys.len == round_keys.len`.
+pub fn invertRoundKeys(comptime n: u4, dec_round_keys: []AesBlock, round_keys: []const AesBlock) void {
+    assert(dec_round_keys.len == round_keys.len);
+    const enc_beta = &tables.enc_beta[n - tables.n_min];
+    const dec_alpha = &tables.dec_alpha[n - tables.n_min];
+    const a: AesBlock = .fromBytes(&tables.const_a[n - tables.n_min]);
+
+    for (dec_round_keys, round_keys) |*dec_round_key, round_key| {
+        const folded = round_key.xorBlocks(shuffle(round_key, enc_beta));
+        dec_round_key.* = a.xorBlocks(shuffle(folded, dec_alpha)).invMixColumns();
+    }
+}
 
 /// ALF-n-t, where a block is made of `n` bytes followed by `t` bits.
 pub fn AlfNt(comptime n: u4, comptime t: u3) type {
-    comptime assert(n >= 2); // n must be in [2, 15]
+    comptime assert(n >= tables.n_min);
 
     return struct {
         /// The size of a block in bits.
@@ -48,16 +70,15 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
         /// The number of bytes a block is stored in.
         pub const block_length = @divCeil(block_bits, 8);
         /// The number of rounds, which is also the number of round keys.
-        pub const rounds = tables.rounds[n - tables.n_min][@intFromBool(t != 0)];
-        /// The number of rounds between two range checks when encrypting an integer.
-        pub const rounds_per_check = 2;
+        pub const rounds = (Shape{ .n = n, .t = t }).rounds();
 
+        // The number of rounds between two range checks when encrypting an integer.
+        const rounds_per_check = 2;
         // The n-byte register X and the t-bit register E.
         const State = struct { x: AesBlock, e: AesBlock };
 
         const enc_sigma = &tables.enc_sigma[n - tables.n_min];
         const enc_beta = &tables.enc_beta[n - tables.n_min];
-        const dec_alpha = &tables.dec_alpha[n - tables.n_min];
         const dec_beta = &tables.dec_beta[n - tables.n_min];
         const dec_sigma = &tables.dec_sigma[n - tables.n_min];
         const dec_tau = &tables.dec_tau[n - tables.n_min];
@@ -68,7 +89,6 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
         const e_mask_bytes = [_]u8{e_mask} ++ @as([15]u8, @splat(0));
 
         comptime {
-            assert(rounds <= max_rounds);
             assert(rounds % rounds_per_check == 0);
         }
 
@@ -114,29 +134,20 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
             if (c >= q) return error.ValueOutOfRange;
 
             var state = fromInt(c);
+            state.x = aux(state.x);
             var i: usize = rounds;
             while (i != 0) {
                 i -= rounds_per_check;
                 const group = dec_round_keys[i..][0..rounds_per_check];
                 while (true) {
-                    state.x = aux(state.x);
                     state = decryptRounds(state, group);
-                    state.x = srf(state.x);
-                    if (toInt(state) < q) break;
+                    // The final step is only needed to read the value.
+                    // `aux` would undo it before the next rounds, so X keeps its internal form.
+                    if (toInt(.{ .x = srf(state.x), .e = state.e }) < q) break;
                 }
             }
+            state.x = srf(state.x);
             return toInt(state);
-        }
-
-        /// Turns encryption round keys into decryption round keys.
-        pub fn invertRoundKeys(round_keys: [rounds]AesBlock) [rounds]AesBlock {
-            const a: AesBlock = .fromBytes(&tables.const_a[n - tables.n_min]);
-            var dec_round_keys: [rounds]AesBlock = undefined;
-            for (&dec_round_keys, round_keys) |*dec_round_key, round_key| {
-                const folded = round_key.xorBlocks(shuffle(round_key, enc_beta));
-                dec_round_key.* = a.xorBlocks(shuffle(folded, dec_alpha)).invMixColumns();
-            }
-            return dec_round_keys;
         }
 
         fn checkModulus(q: u128) ModulusOutOfRangeError!void {
@@ -160,25 +171,27 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
             var x_bytes: [16]u8 = undefined;
             mem.writeInt(u128, &x_bytes, v & x_mask, .little);
             var e_bytes: [16]u8 = @splat(0);
-            e_bytes[0] = @intCast(v >> (8 * @as(u7, n)));
+            if (t != 0) e_bytes[0] = @intCast(v >> (8 * @as(u7, n)));
             return .{ .x = .fromBytes(&x_bytes), .e = .fromBytes(&e_bytes) };
         }
 
         fn toInt(state: State) u128 {
-            const x = mem.readInt(u128, &state.x.toBytes(), .little) & x_mask;
-            const e: u128 = state.e.toBytes()[0];
-            return x | (e << (8 * @as(u7, n)));
+            // Putting the bytes together one by one is faster than reading the whole register and masking it.
+            const x_bytes = state.x.toBytes();
+            var v: u128 = 0;
+            for (x_bytes[0..n], 0..) |byte, i| v |= @as(u128, byte) << @intCast(8 * i);
+            if (t != 0) v |= @as(u128, state.e.toBytes()[0]) << (8 * @as(u7, n));
+            return v;
         }
 
         // Runs one encryption round per key.
         fn encryptRounds(state: State, round_keys: []const AesBlock) State {
-            const zero: AesBlock = .fromBytes(&@splat(0));
             var x = state.x;
             var e = state.e;
             for (round_keys) |round_key| {
                 const u = shuffle(x, enc_sigma).encrypt(round_key);
                 x = u.xorBlocks(shuffle(u, enc_beta)).xorBlocks(shuffle(e, rho));
-                if (t != 0) e = updateE(e, u, zero);
+                if (t != 0) e = updateE(e, u);
             }
             return .{ .x = x, .e = e };
         }
@@ -194,7 +207,7 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
                 i -= 1;
                 const round_key = dec_round_keys[i];
                 const w = shuffle(x, dec_sigma).decrypt(round_key);
-                if (t != 0) e = updateE(e, w.xorBlocks(round_key), b);
+                if (t != 0) e = updateE(e.xorBlocks(b), w.xorBlocks(round_key));
                 x = w.xorBlocks(shuffle(w, dec_beta)).xorBlocks(shuffle(e, rho));
             }
             return .{ .x = x, .e = e };
@@ -211,27 +224,26 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
         }
 
         // Mixes the parity of the first column of `u` into the t extra bits.
-        fn updateE(e: AesBlock, u: AesBlock, b: AesBlock) AesBlock {
-            const lanes: @Vector(4, u32) = @bitCast(u.toBytes());
+        fn updateE(e: AesBlock, u: AesBlock) AesBlock {
+            // Both casts are between vectors.
+            // Casting the byte array directly sends every byte through a general purpose register.
+            const u_bytes: @Vector(16, u8) = u.toBytes();
+            const lanes: @Vector(4, u32) = @bitCast(u_bytes);
             const fold16 = lanes ^ (lanes >> @splat(16));
             const fold8 = fold16 ^ (fold16 >> @splat(8));
-            const parity: AesBlock = .fromBytes(&@bitCast(fold8));
-            return e.xorBlocks(b).xorBlocks(parity).andBlocks(.fromBytes(&e_mask_bytes));
+            const parity_bytes: @Vector(16, u8) = @bitCast(fold8);
+            const parity: AesBlock = .fromBytes(&@as([16]u8, parity_bytes));
+            return e.xorBlocks(parity).andBlocks(.fromBytes(&e_mask_bytes));
         }
     };
 }
 
-// Byte shuffle with the PSHUFB convention: a negative control byte gives zero.
+// Byte shuffle with the PSHUFB convention: a negative index gives zero.
 fn shuffle(x: AesBlock, comptime ctrl: *const tables.Shuffle) AesBlock {
-    // For `@shuffle`, a negative index picks from the second vector, which is all zeros here.
-    const mask = comptime mask: {
-        var indices: [16]i32 = undefined;
-        for (&indices, ctrl) |*index, c| index.* = if (c < 0) -1 else c;
-        break :mask indices;
-    };
+    // For `@shuffle`, a negative index picks from the second vector.
     const src: @Vector(16, u8) = x.toBytes();
     const zeros: @Vector(16, u8) = @splat(0);
-    const out: [16]u8 = @shuffle(u8, src, zeros, mask);
+    const out: [16]u8 = @shuffle(u8, src, zeros, ctrl.*);
     return .fromBytes(&out);
 }
 
@@ -267,22 +279,23 @@ test "AlfNt - ALF-11-5 reference vector from Appendix C" {
     Alf11_5.encrypt(&c, &m, &round_keys);
     try testing.expectEqualSlices(u8, &expected, &c);
 
+    var dec_round_keys: [Alf11_5.rounds]AesBlock = undefined;
+    invertRoundKeys(11, &dec_round_keys, &round_keys);
     var m2: [Alf11_5.block_length]u8 = undefined;
-    Alf11_5.decrypt(&m2, &c, &Alf11_5.invertRoundKeys(round_keys));
+    Alf11_5.decrypt(&m2, &c, &dec_round_keys);
     try testing.expectEqualSlices(u8, &m, &m2);
 }
 
-test "AlfNt - integers map to distinct integers below the modulus" {
+test "AlfNt - integers round trip below a modulus far under the block size" {
     const Alf3_0 = AlfNt(3, 0);
     const q = 50000;
     const round_keys = testRoundKeys(Alf3_0);
-    const dec_round_keys = Alf3_0.invertRoundKeys(round_keys);
+    var dec_round_keys: [Alf3_0.rounds]AesBlock = undefined;
+    invertRoundKeys(3, &dec_round_keys, &round_keys);
 
-    var seen: [q]bool = @splat(false);
     for (0..200) |m| {
         const c = try Alf3_0.encryptInt(m, q, &round_keys);
-        try testing.expect(c < q and !seen[@intCast(c)]);
-        seen[@intCast(c)] = true;
+        try testing.expect(c < q);
         try testing.expectEqual(m, try Alf3_0.decryptInt(c, q, &dec_round_keys));
     }
 }

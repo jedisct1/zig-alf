@@ -51,6 +51,8 @@ pub const Alf = union(enum) {
         dec_keys: [alf_16t.rounds]AesBlock,
     },
 
+    /// Sets up the cipher for the integers in [0, q).
+    /// `q` must be in [2, `max_modulus`].
     pub fn init(key: [key_length]u8, tweak: [tweak_length]u8, app_id: u64, q: u160) ModulusOutOfRangeError!Alf {
         if (q < 2 or q > max_modulus) return error.ModulusOutOfRange;
         return fromState(.init(key, app_id, .{ .integer = q }), tweak, q);
@@ -75,17 +77,12 @@ pub const Alf = union(enum) {
         }
         if (q <= 1 << 127) {
             const shape = alf_nt.Shape.fromModulus(@intCast(q)).?;
+            const rounds = shape.rounds();
             var enc_keys: [alf_nt.max_rounds]AesBlock = undefined;
             var dec_keys: [alf_nt.max_rounds]AesBlock = undefined;
+            tweaked.deriveRoundKeys(enc_keys[0..rounds], shape.n, 0);
             switch (shape.n) {
-                inline 2...15 => |n| switch (shape.t) {
-                    inline else => |t| {
-                        const Variant = AlfNt(n, t);
-                        const round_keys = enc_keys[0..Variant.rounds];
-                        tweaked.deriveRoundKeys(round_keys, n, 0);
-                        dec_keys[0..Variant.rounds].* = Variant.invertRoundKeys(round_keys.*);
-                    },
-                },
+                inline 2...15 => |n| alf_nt.invertRoundKeys(n, dec_keys[0..rounds], enc_keys[0..rounds]),
                 else => unreachable,
             }
             return .{ .alf_nt = .{ .shape = shape, .q = @intCast(q), .enc_keys = enc_keys, .dec_keys = dec_keys } };

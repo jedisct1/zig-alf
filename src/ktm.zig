@@ -12,6 +12,10 @@ const AesBlock = crypto.core.aes.Block;
 pub const key_length = 16;
 pub const tweak_length = 16;
 
+/// The largest number of bytes one call to `State.deriveBytes` can produce.
+/// Past that, the block counter would run into `d`.
+pub const max_derived_length = 255 * 48;
+
 /// The "1*" block of the paper, absorbed between groups of data blocks.
 pub const one_star = [_]u8{0x01} ++ @as([15]u8, @splat(0));
 
@@ -119,7 +123,9 @@ pub const State = struct {
 
     /// Fills `out` with key material.
     /// `d` keeps the different uses of one state apart.
+    /// Asserts `out.len <= max_derived_length`.
     pub fn deriveBytes(state: State, out: []u8, d: u8) void {
+        assert(out.len <= max_derived_length);
         var offset: usize = 0;
         var c: u32 = 1;
         while (offset < out.len) : (c += 1) {

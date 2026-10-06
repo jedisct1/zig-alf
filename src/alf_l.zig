@@ -37,7 +37,7 @@ pub const AlfL = struct {
     /// The moduli of a vector.
     /// A modulus of 0 stands for 2^16.
     ///
-    /// For more than one symbol, `same` and `distinct` give unrelated ciphertexts,
+    /// For more than one symbol, `same` and `distinct` use unrelated keys,
     /// even if every entry of the `distinct` list is equal.
     pub const Moduli = union(enum) {
         same: u16,
@@ -58,6 +58,7 @@ pub const AlfL = struct {
         }
     };
 
+    /// Where a vector is cut between the packed part X and the rest.
     pub const Split = struct { lambda: usize, q_lambda: u160 };
 
     /// Returns how many leading symbols of an n-symbol vector are packed into X,

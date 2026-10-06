@@ -3,7 +3,7 @@
     .version = "0.0.0",
     // Generated once by the toolchain. Never change it.
     .fingerprint = 0xdbcd98c3f71d805a,
-    .minimum_zig_version = "0.17.0-dev.370+a06f23c8e",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
