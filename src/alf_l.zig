@@ -213,11 +213,9 @@ fn divRem(x: *u160, divisor: u64) u64 {
 }
 
 fn domain(moduli: AlfL.Moduli, n: usize) ktm.Domain {
-    if (n == 1) return .{ .integer = moduli.at(0) };
-    return switch (moduli) {
-        .same => |q| .{ .same = .{ .n = @intCast(n), .q = q } },
-        .distinct => |qs| .{ .distinct = qs },
-    };
+    // A single symbol is an integer, whichever way its modulus was given.
+    if (moduli == .distinct and n > 1) return .{ .distinct = moduli.distinct };
+    return .{ .same = .{ .n = @intCast(n), .q = moduli.at(0) } };
 }
 
 // Returns the round keys for encrypting X, bound to the current Y.
@@ -265,10 +263,12 @@ fn applyKeystream(comptime direction: Direction, generator: *ModPrng, y: []u16, 
         generator.fill(samples[0..count], qs);
         for (y[i..][0..count], samples[0..count], qs) |*symbol, sample, q16| {
             const q = prng.fullModulus(q16);
-            symbol.* = @intCast(switch (direction) {
-                .encrypt => (@as(u32, symbol.*) + sample) % q,
-                .decrypt => (@as(u32, symbol.*) + q - sample) % q,
-            });
+            const sum = switch (direction) {
+                .encrypt => @as(u32, symbol.*) + sample,
+                .decrypt => @as(u32, symbol.*) + q - sample,
+            };
+            // Both terms are below q, so one subtraction is enough to reduce the sum.
+            symbol.* = @intCast(if (sum >= q) sum - q else sum);
         }
     }
 }

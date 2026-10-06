@@ -142,7 +142,7 @@ pub fn AlfNt(comptime n: u4, comptime t: u3) type {
                 while (true) {
                     state = decryptRounds(state, group);
                     // The final step is only needed to read the value.
-                    // `aux` would undo it before the next rounds, so X keeps its internal form.
+                    // `aux` undoes it on every byte the rounds read, so X keeps its internal form.
                     if (toInt(.{ .x = srf(state.x), .e = state.e }) < q) break;
                 }
             }

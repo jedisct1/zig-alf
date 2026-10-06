@@ -19,16 +19,12 @@ const ValueOutOfRangeError = errors.ValueOutOfRangeError;
 /// The number of rounds, which is also the number of round keys.
 pub const rounds = 12;
 
-/// The number of rounds between two range checks when encrypting an integer.
-pub const rounds_per_check = 2;
-
-comptime {
-    assert(rounds % rounds_per_check == 0);
-}
+// The number of rounds between two range checks when encrypting an integer.
+const rounds_per_check = 2;
 
 /// ALF-16-t, where a block is made of 16 bytes followed by `t` bits.
 pub fn Alf16t(comptime t: u5) type {
-    comptime assert(t <= 16); // t must be in [0, 16]
+    comptime assert(t <= 16);
 
     return struct {
         /// The size of a block in bits.
@@ -37,9 +33,11 @@ pub fn Alf16t(comptime t: u5) type {
         pub const block_length = @divCeil(block_bits, 8);
 
         // The 128-bit register X and the t-bit register E.
-        const State = struct { x: AesBlock, e: u16 };
+        // E is kept the way the rounds use it, see `broadcast`.
+        const State = struct { x: AesBlock, e: AesBlock };
 
         const e_mask = math.maxInt(@Int(.unsigned, t));
+        const e_mask_bytes = broadcast(e_mask);
 
         /// Encrypts a block.
         ///
@@ -104,15 +102,13 @@ pub fn Alf16t(comptime t: u5) type {
         }
 
         fn load(src: *const [block_length]u8) State {
-            return .{
-                .x = .fromBytes(src[0..16]),
-                .e = mem.readVarInt(u16, src[16..], .little) & e_mask,
-            };
+            const e = mem.readVarInt(u16, src[16..], .little) & e_mask;
+            return .{ .x = .fromBytes(src[0..16]), .e = .fromBytes(&broadcast(e)) };
         }
 
         fn store(dst: *[block_length]u8, state: State) void {
             var e_bytes: [2]u8 = undefined;
-            mem.writeInt(u16, &e_bytes, state.e, .little);
+            mem.writeInt(u16, &e_bytes, narrow(state.e), .little);
             dst[0..16].* = state.x.toBytes();
             dst[16..].* = e_bytes[0 .. block_length - 16].*;
         }
@@ -120,12 +116,12 @@ pub fn Alf16t(comptime t: u5) type {
         fn fromInt(v: u160) State {
             var x_bytes: [16]u8 = undefined;
             mem.writeInt(u128, &x_bytes, @truncate(v), .little);
-            return .{ .x = .fromBytes(&x_bytes), .e = @intCast(v >> 128) };
+            return .{ .x = .fromBytes(&x_bytes), .e = .fromBytes(&broadcast(@intCast(v >> 128))) };
         }
 
         fn toInt(state: State) u160 {
             const x = mem.readInt(u128, &state.x.toBytes(), .little);
-            return x | (@as(u160, state.e) << 128);
+            return x | (@as(u160, narrow(state.e)) << 128);
         }
 
         // Runs one encryption round per key.
@@ -134,8 +130,8 @@ pub fn Alf16t(comptime t: u5) type {
             var e = state.e;
             for (round_keys) |round_key| {
                 const u = x.encrypt(round_key);
-                x = u.xorBlocks(broadcast(e));
-                if (t != 0) e = (e ^ columnParity(u)) & e_mask;
+                x = u.xorBlocks(e);
+                if (t != 0) e = e.xorBlocks(columnParity(u)).andBlocks(.fromBytes(&e_mask_bytes));
             }
             return .{ .x = x, .e = e };
         }
@@ -150,8 +146,8 @@ pub fn Alf16t(comptime t: u5) type {
             while (i != 0) {
                 i -= 1;
                 x = x.decrypt(zero);
-                if (t != 0) e = (e ^ columnParity(x)) & e_mask;
-                x = x.xorBlocks(dec_round_keys[i]).xorBlocks(broadcast(e));
+                if (t != 0) e = e.xorBlocks(columnParity(x)).andBlocks(.fromBytes(&e_mask_bytes));
+                x = x.xorBlocks(dec_round_keys[i]).xorBlocks(e);
             }
             return .{ .x = x, .e = e };
         }
@@ -165,20 +161,27 @@ pub fn invertRoundKeys(round_keys: [rounds]AesBlock) [rounds]AesBlock {
     return dec_round_keys;
 }
 
-// The two bytes of E, each repeated over one of the first two columns.
-fn broadcast(e: u16) AesBlock {
+// Returns the low byte of E repeated over the first column, and its high byte over the second.
+// This is what a round mixes into X, and keeping E that way avoids a conversion per round.
+fn broadcast(e: u16) [16]u8 {
     var bytes: [16]u8 = @splat(0);
     @memset(bytes[0..4], @truncate(e));
     @memset(bytes[4..8], @truncate(e >> 8));
-    return .fromBytes(&bytes);
+    return bytes;
 }
 
-// XOR of the four bytes of each of the first two columns.
-fn columnParity(u: AesBlock) u16 {
-    const bytes = u.toBytes();
-    const p0 = bytes[0] ^ bytes[1] ^ bytes[2] ^ bytes[3];
-    const p1 = bytes[4] ^ bytes[5] ^ bytes[6] ^ bytes[7];
-    return (@as(u16, p1) << 8) | p0;
+// Inverse of `broadcast`.
+fn narrow(e: AesBlock) u16 {
+    const bytes = e.toBytes();
+    return (@as(u16, bytes[4]) << 8) | bytes[0];
+}
+
+// Returns the XOR of the four bytes of each column, repeated over that column.
+fn columnParity(u: AesBlock) AesBlock {
+    const bytes: @Vector(16, u8) = u.toBytes();
+    const pairs = bytes ^ @shuffle(u8, bytes, undefined, [16]i32{ 2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13 });
+    const parity = pairs ^ @shuffle(u8, pairs, undefined, [16]i32{ 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14 });
+    return .fromBytes(&@as([16]u8, parity));
 }
 
 // Extra step needed once before the decryption rounds.

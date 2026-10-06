@@ -177,7 +177,7 @@ test "Alf - single integers (T vectors)" {
         count += 1;
 
         const q: u160 = @intCast(v.q_max + 1);
-        const state: ktm.State = .init(ref_key, ref_app_id, .{ .integer = q });
+        const state: ktm.State = .init(ref_key, ref_app_id, .{ .same = .{ .n = 1, .q = q } });
         try v.expectEqual("KeyInit state", &v.key_state, &state.toBytes());
 
         const alf: Alf = try .init(ref_key, ref_tweak, ref_app_id, q);

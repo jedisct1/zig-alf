@@ -55,7 +55,7 @@ pub const Alf = union(enum) {
     /// `q` must be in [2, `max_modulus`].
     pub fn init(key: [key_length]u8, tweak: [tweak_length]u8, app_id: u64, q: u160) ModulusOutOfRangeError!Alf {
         if (q < 2 or q > max_modulus) return error.ModulusOutOfRange;
-        return fromState(.init(key, app_id, .{ .integer = q }), tweak, q);
+        return fromState(.init(key, app_id, .{ .same = .{ .n = 1, .q = q } }), tweak, q);
     }
 
     /// Same as `init`, with a key state the caller already has.

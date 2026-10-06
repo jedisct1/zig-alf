@@ -20,13 +20,12 @@ pub const max_derived_length = 255 * 48;
 pub const one_star = [_]u8{0x01} ++ @as([15]u8, @splat(0));
 
 /// What is being encrypted.
-/// A modulus of 0 stands for 2^16.
 pub const Domain = union(enum) {
-    /// One integer in [0, q), with q in [2, 2^144].
-    integer: u160,
-    /// Several symbols that all use the modulus q.
-    same: struct { n: u48, q: u16 },
+    /// `n` symbols that all use the modulus q.
+    /// A single integer is one symbol, with q in [2, 2^144].
+    same: struct { n: u48, q: u160 },
     /// Several symbols, each with its own modulus.
+    /// A modulus of 0 stands for 2^16.
     distinct: []const u16,
 };
 
@@ -40,11 +39,10 @@ pub const State = struct {
     /// This is `KeyInit` in the paper.
     pub fn init(key: [key_length]u8, app_id: u64, domain: Domain) State {
         // The state starts with the symbol count N and a value Q - 1.
-        // Q is the modulus for a single integer and the shared modulus for symbols that have one.
+        // Q is the modulus the symbols share.
         // With distinct moduli Q is 1, and the moduli are absorbed afterwards.
         const header: struct { n: u48, q_max: u144 } = switch (domain) {
-            .integer => |q| .{ .n = 1, .q_max = @intCast(q - 1) },
-            .same => |s| .{ .n = s.n, .q_max = s.q -% 1 },
+            .same => |s| .{ .n = s.n, .q_max = @intCast(s.q - 1) },
             .distinct => |qs| .{ .n = @intCast(qs.len), .q_max = 0 },
         };
 
@@ -138,6 +136,7 @@ pub const State = struct {
 
     /// Fills `round_keys` with round keys of `n` bytes each.
     /// Bytes past `n` are zero.
+    /// Asserts `n <= 16` and `round_keys.len <= 32`.
     pub fn deriveRoundKeys(state: State, round_keys: []AesBlock, n: usize, d: u8) void {
         var buf: [16 * 32]u8 = undefined;
         assert(n <= 16 and round_keys.len <= 32);
