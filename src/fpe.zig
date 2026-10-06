@@ -1,21 +1,17 @@
-//! Cycle-sliding format-preserving encryption built on top of ALF-n-t.
+//! Format-preserving encryption of an integer in [0, Q), built on ALF-n-t.
+//! See Algorithm 2 of the ALF paper.
 //!
-//! Algorithm 2 of the ALF paper. With k = 2, the cipher applies two rounds at a
-//! time and checks after each group whether the intermediate value lies in the
-//! valid set [0, Q). If not, the same two rounds are applied again until it
-//! does. Cycle-sliding guarantees ≥ r rounds of the underlying block cipher and
-//! is strictly more responsive than classic cycle-walking (k = r).
+//! Rounds are applied two at a time.
+//! After each pair, if the value is not below Q, the same pair is applied again until it is.
+//! The paper calls this cycle-sliding.
 //!
-//! Decryption mirrors encryption: for each group (in reverse), apply k inverse
-//! rounds and repeat until the result lies in [0, Q). Chaining `alf.decrypt`
-//! calls works because the SRF of one call cancels the auxiliary step of the
-//! next on the meaningful n bytes.
+//! Decryption undoes the pairs in reverse order, with the same retry rule.
 
 const std = @import("std");
 const alf = @import("alf_nt.zig");
 const tables = @import("tables.zig");
 
-/// Fixed group size for ALF cycle-sliding.
+/// Number of rounds between two range checks.
 pub const k: u8 = 2;
 
 pub const Error = alf.Error || error{
@@ -46,19 +42,17 @@ fn storeInteger(comptime n: u8, comptime t: u8, v: u128, out: []u8) void {
     if (t != 0) out[n] = @as(u8, @truncate(v >> @intCast(8 * n))) & maskByte(t);
 }
 
-/// Width in bits of the cipher (n, t).
 pub fn width(comptime n: u8, comptime t: u8) u8 {
     return 8 * n + t;
 }
 
-/// Total byte footprint of a plaintext/ciphertext (the trailing byte is
-/// counted once even when t < 8).
+/// Number of bytes a value takes.
 pub fn byteLength(comptime n: u8, comptime t: u8) u8 {
     return n + @intFromBool(t != 0);
 }
 
-/// Pick the (n, t) pair that fits the given modulus Q for ALF-n-t FPE.
-/// Returns null when Q ≤ 2^15 (use ALF-1-t) or Q > 2^127 (use ALF-16-t).
+/// Smallest (n, t) that fits the modulus.
+/// Null when Q is too small (use ALF-1-t) or too large (use ALF-16-t).
 pub fn selectShape(q: u128) ?struct { n: u8, t: u8 } {
     if (q <= (@as(u128, 1) << 15)) return null;
     if (q > (@as(u128, 1) << 127)) return null;
@@ -74,7 +68,7 @@ fn validateModulus(comptime n: u8, comptime t: u8, q: u128) Error!void {
     if (w < 128 and q > (@as(u128, 1) << @intCast(w))) return error.ModulusOutOfRange;
 }
 
-/// FPE encrypt: maps a plaintext in [0, Q) to a ciphertext in [0, Q).
+/// Encrypt an integer in [0, Q) to another integer in [0, Q).
 pub fn encryptInt(
     comptime n: u8,
     comptime t: u8,
@@ -122,7 +116,7 @@ fn stateInteger(comptime n: u8, comptime t: u8, state: alf.State) u128 {
     return v;
 }
 
-/// Byte-oriented wrapper around `encryptInt`.
+/// Same as `encryptInt`, on little-endian bytes.
 pub fn encrypt(
     comptime n: u8,
     comptime t: u8,
@@ -138,7 +132,7 @@ pub fn encrypt(
     storeInteger(n, t, ct_int, ciphertext);
 }
 
-/// FPE decrypt: inverse of `encryptInt`.
+/// Inverse of `encryptInt`.
 pub fn decryptInt(
     comptime n: u8,
     comptime t: u8,
@@ -202,37 +196,10 @@ test "selectShape picks tightest (n, t)" {
     try std.testing.expectEqual(@as(?@TypeOf(selectShape(0).?), null), selectShape((@as(u128, 1) << 127) + 1));
 }
 
-test "FPE round-trip with k=2 over a non-trivial modulus" {
-    @setEvalBranchQuota(20_000);
-    const n: u8 = 6;
-    const t: u8 = 6; // width 54 bits.
-    const q: u128 = 10_000_000_000_000_000; // 16 decimal digits, fits in 54 bits.
-    const r = alf.roundCount(n, t);
-
-    var enc_rk: [alf.max_rounds]Block = undefined;
-    for (enc_rk[0..r], 0..) |*rk, idx| {
-        var bytes: [16]u8 = @splat(0);
-        for (0..n) |i| bytes[i] = @intCast((idx * 47 + i * 11 + 9) & 0xff);
-        rk.* = Block.fromBytes(&bytes);
-    }
-    var dec_rk: [alf.max_rounds]Block = undefined;
-    alf.prepareDecryption(n, enc_rk[0..r], dec_rk[0..r]);
-
-    var rng = std.Random.DefaultPrng.init(0xDEAD_BEEF);
-    const rand = rng.random();
-    for (0..64) |_| {
-        const pt = rand.uintLessThan(u128, q);
-        const ct = try encryptInt(n, t, q, enc_rk[0..r], pt);
-        try std.testing.expect(ct < q);
-        const back = try decryptInt(n, t, q, dec_rk[0..r], ct);
-        try std.testing.expectEqual(pt, back);
-    }
-}
-
 test "FPE permutation property: distinct inputs map to distinct outputs" {
     const n: u8 = 3;
     const t: u8 = 0;
-    const q: u128 = 50000; // small enough to enumerate
+    const q: u128 = 50000;
     const r = alf.roundCount(n, t);
 
     var enc_rk: [alf.max_rounds]Block = undefined;
@@ -244,7 +211,6 @@ test "FPE permutation property: distinct inputs map to distinct outputs" {
     var dec_rk: [alf.max_rounds]Block = undefined;
     alf.prepareDecryption(n, enc_rk[0..r], dec_rk[0..r]);
 
-    // Sample 200 plaintexts and verify ciphertexts are unique and bounded.
     var seen: std.AutoHashMapUnmanaged(u128, void) = .empty;
     defer seen.deinit(std.testing.allocator);
     var pt: u128 = 0;

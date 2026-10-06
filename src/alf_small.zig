@@ -1,19 +1,14 @@
-//! ALF-0 and ALF-1-t: small-domain ALF variants from Appendix F.
+//! ALF-0 and ALF-1-t, the ALF variants for small domains (Appendix F of the ALF paper).
 //!
-//! * ALF-0 covers Q ∈ [2, 256] by building a key-dependent secret S-box
-//!   `S_Q` from r = 32 iterations of `aesenclast` over the bytes 0..255,
-//!   then collapsing the 256-byte permutation to the live domain.
-//! * ALF-1-t covers widths 9..15 bits (Q ∈ (2^8, 2^15]) using the Rijndael
-//!   S-box with one extra bit of entropy mixed via a shifted XOR.
+//! * ALF-0 handles Q in [2, 256] with a secret S-box derived from the key.
+//! * ALF-1-t handles 9 to 15 bits, so Q in (2^8, 2^15].
 
 const std = @import("std");
 const aes_core = std.crypto.core.aes;
 
 const Block = aes_core.Block;
 
-/// Compute the Rijndael S-box on a single byte via `aesenclast` with the
-/// byte broadcast across the 16-byte block: SR + SB collapse to SB when
-/// all input bytes are equal.
+/// AES S-box of one byte, computed with the AES round primitive instead of a table.
 pub fn rijndaelSbox(byte: u8) u8 {
     const zero_bytes: [16]u8 = @splat(0);
     const byte_bytes: [16]u8 = @splat(byte);
@@ -31,9 +26,8 @@ pub const alf_0 = struct {
 
     pub const Error = error{ModulusOutOfRange};
 
-    /// Key-dependent permutation on [0, Q). `q` must lie in [2, 256].
-    /// `enc_table` and `dec_table` cover only the first `q` entries; entries
-    /// beyond `q` are zero-initialised but should not be accessed.
+    /// Secret permutation of [0, q), for q in [2, 256].
+    /// Only the first q entries of each table are meaningful.
     pub const Cipher = struct {
         q: u16,
         enc_table: [256]u8,
@@ -68,13 +62,10 @@ pub const alf_0 = struct {
         }
     };
 
-    /// Build the secret 256-byte permutation S256 = S ∘ ⊕RK[r-1] ∘ ... ∘ S ∘ ⊕RK[0].
+    /// Build the secret permutation of all 256 byte values.
     ///
-    /// `aesenclast` with a single-byte round key broadcast across the block
-    /// applies SR+SB+XOR; because SR commutes with byte-broadcast XOR and
-    /// `SR^4 = I`, every 4 calls produce one composed Rijndael round on each
-    /// position independently. With r = 32 = 8·4, the per-position effect
-    /// after the full chain is S256 of the starting byte at that position.
+    /// Each `aesenclast` call also moves bytes around, and four calls bring them back in place.
+    /// The round count is a multiple of four, so every byte ends up where it started.
     fn computeS256(round_keys: [rounds]u8) [256]u8 {
         var s256: [256]u8 = undefined;
         for (0..16) |k| {
@@ -99,23 +90,23 @@ pub const alf_1t = struct {
     pub const Error = error{ ModulusOutOfRange, ValueOutOfRange };
 
     pub fn validate(comptime t: u8) void {
-        comptime if (t < 1 or t > 7) @compileError("ALF-1-t requires t ∈ [1, 7]");
+        comptime if (t < 1 or t > 7) @compileError("ALF-1-t requires t in [1, 7]");
     }
 
     fn mask(comptime t: u8) u8 {
         return (@as(u8, 1) << t) - 1;
     }
 
-    /// Inner forward round (single round): updates (X, E) in place.
+    /// One encryption round.
     fn forwardRound(comptime t: u8, x: *u8, e: *u8, rk: u8) void {
         const u = rijndaelSbox(x.*) ^ rk;
         x.* = u ^ (e.* << 1);
         e.* = (u ^ e.*) & mask(t);
     }
 
-    /// Inner reverse round (single round).
+    /// One decryption round.
     fn reverseRound(comptime t: u8, x: *u8, e: *u8, rk: u8) void {
-        // Recover E from (X', E') using `clmul(X' ⊕ E', 0xff)` low t bits.
+        // Bit i of the previous E is the XOR of bits 0..i of X ^ E.
         const a = x.* ^ e.*;
         var prefix: u8 = 0;
         var new_e: u8 = 0;
@@ -128,9 +119,7 @@ pub const alf_1t = struct {
         x.* = rijndaelInvSbox(x.* ^ (e.* << 1) ^ rk);
     }
 
-    /// FPE encrypt for ALF-1-t with cycle-sliding. `q` may be any value in
-    /// (2^8, 2^15]; when `q == 2^(8+t)`, the cipher reduces to a plain
-    /// length-preserving block cipher.
+    /// Encrypt a value in [0, q), for q in (2^8, 2^(8 + t)].
     pub fn encrypt(
         comptime t: u8,
         q: u16,
@@ -157,7 +146,7 @@ pub const alf_1t = struct {
         return (@as(u16, e) << 8) + x;
     }
 
-    /// FPE decrypt for ALF-1-t.
+    /// Inverse of `encrypt`.
     pub fn decrypt(
         comptime t: u8,
         q: u16,
@@ -187,76 +176,34 @@ pub const alf_1t = struct {
     }
 };
 
-test "Rijndael Sbox via aesenclast" {
-    try std.testing.expectEqual(@as(u8, 0x63), rijndaelSbox(0x00));
-    try std.testing.expectEqual(@as(u8, 0x7c), rijndaelSbox(0x01));
-    try std.testing.expectEqual(@as(u8, 0x16), rijndaelSbox(0xff));
-    try std.testing.expectEqual(@as(u8, 0x00), rijndaelInvSbox(0x63));
-    try std.testing.expectEqual(@as(u8, 0xff), rijndaelInvSbox(0x16));
-}
-
-test "ALF-0 round-trip across every plaintext" {
-    const q: u16 = 100;
+test "ALF-0 is a permutation of [0, q)" {
     var rk: [alf_0.rounds]u8 = undefined;
     for (&rk, 0..) |*b, i| b.* = @intCast(i * 7 + 11);
-    const c = try alf_0.Cipher.init(q, &rk);
 
-    var seen: [100]bool = @splat(false);
-    for (0..q) |x| {
-        const y = c.encrypt(@intCast(x));
-        try std.testing.expect(y < q);
-        try std.testing.expect(!seen[y]);
-        seen[y] = true;
-        try std.testing.expectEqual(@as(u8, @intCast(x)), c.decrypt(y));
+    for ([_]u16{ 100, 256 }) |q| {
+        const c = try alf_0.Cipher.init(q, &rk);
+        var seen: [256]bool = @splat(false);
+        for (0..q) |x| {
+            const y = c.encrypt(@intCast(x));
+            try std.testing.expect(y < q and !seen[y]);
+            seen[y] = true;
+            try std.testing.expectEqual(x, c.decrypt(y));
+        }
     }
 }
 
-test "ALF-0 with full domain Q=256 is a permutation of [0, 256)" {
-    const q: u16 = 256;
-    var rk: [alf_0.rounds]u8 = undefined;
-    for (&rk, 0..) |*b, i| b.* = @intCast((i * 31 + 17) & 0xff);
-    const c = try alf_0.Cipher.init(q, &rk);
-
-    var seen: [256]bool = @splat(false);
-    for (0..256) |x| {
-        const y = c.encrypt(@intCast(x));
-        try std.testing.expect(!seen[y]);
-        seen[y] = true;
-    }
-}
-
-test "ALF-1-t round-trip across all plaintexts (small Q)" {
-    const t: u8 = 4;
-    const q: u16 = 1000;
+test "ALF-1-t is a permutation of [0, q)" {
     var rk: [alf_1t.rounds]u8 = undefined;
     for (&rk, 0..) |*b, i| b.* = @intCast((i * 13 + 5) & 0xff);
 
-    var seen: [1000]bool = @splat(false);
-    var pt: u16 = 0;
-    while (pt < q) : (pt += 1) {
-        const ct = try alf_1t.encrypt(t, q, &rk, pt);
-        try std.testing.expect(ct < q);
-        try std.testing.expect(!seen[ct]);
-        seen[ct] = true;
-        const back = try alf_1t.decrypt(t, q, &rk, ct);
-        try std.testing.expectEqual(pt, back);
-    }
-}
-
-test "ALF-1-t length-preserving (Q = 2^(8+t)) over all values" {
-    const t: u8 = 3;
-    const q: u16 = 1 << (8 + t); // 2048
-    var rk: [alf_1t.rounds]u8 = undefined;
-    for (&rk, 0..) |*b, i| b.* = @intCast((i * 53 + 99) & 0xff);
-
-    var seen: [2048]bool = @splat(false);
-    var pt: u16 = 0;
-    while (pt < q) : (pt += 1) {
-        const ct = try alf_1t.encrypt(t, q, &rk, pt);
-        try std.testing.expect(ct < q);
-        try std.testing.expect(!seen[ct]);
-        seen[ct] = true;
-        const back = try alf_1t.decrypt(t, q, &rk, ct);
-        try std.testing.expectEqual(pt, back);
+    inline for (.{ .{ 4, 1000 }, .{ 3, 2048 } }) |case| {
+        const t, const q = case;
+        var seen: [q]bool = @splat(false);
+        for (0..q) |x| {
+            const y = try alf_1t.encrypt(t, q, &rk, @intCast(x));
+            try std.testing.expect(y < q and !seen[y]);
+            seen[y] = true;
+            try std.testing.expectEqual(x, try alf_1t.decrypt(t, q, &rk, y));
+        }
     }
 }

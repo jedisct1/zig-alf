@@ -1,4 +1,4 @@
-//! Tiny demo: encrypt a 16-digit credit-card number with cycle-sliding ALF-n-t.
+//! Demo: encrypt a 16-digit card number into another 16-digit number.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,50 +11,19 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
-    // 16 decimal digits of credit-card → modulus 10^16, which fits in a
-    // 54-bit cipher (ALF-6-6).
-    const n: u8 = 6;
-    const t: u8 = 6;
-    const q: u128 = 10_000_000_000_000_000;
-    const rounds = alf.alf_nt.roundCount(n, t);
-
+    const q = 10_000_000_000_000_000;
     const key: [16]u8 = @splat(0x42);
     const tweak: [16]u8 = @splat(0x07);
+    const cipher: alf.alf_int.Cipher = try .init(key, tweak, 0xCAFE_F00D, q);
 
-    var enc_rk: [alf.alf_nt.max_rounds]alf.Block = undefined;
-    alf.ktm.alfNtRoundKeys(n, rounds, key, tweak, 0xCAFE_F00D, q, enc_rk[0..rounds]);
-    var dec_rk: [alf.alf_nt.max_rounds]alf.Block = undefined;
-    alf.alf_nt.prepareDecryption(n, enc_rk[0..rounds], dec_rk[0..rounds]);
+    const pan = 4111_1111_1111_1111;
+    const cipher_pan = try cipher.encrypt(pan);
+    const back = try cipher.decrypt(cipher_pan);
 
-    const pan: u128 = 4111_1111_1111_1111;
-    const cipher_pan = try alf.fpe.encryptInt(n, t, q, enc_rk[0..rounds], pan);
-    const back = try alf.fpe.decryptInt(n, t, q, dec_rk[0..rounds], cipher_pan);
-
-    try out.print("ALF-{d}-{d} FPE demo (Q = {d})\n", .{ n, t, q });
+    try out.print("ALF-{d}-{d} FPE demo (Q = {d})\n", .{ cipher.alfnt.n, cipher.alfnt.t, q });
     try out.print("  plaintext  PAN: {d:0>16}\n", .{pan});
     try out.print("  ciphertext PAN: {d:0>16}\n", .{cipher_pan});
     try out.print("  decrypted  PAN: {d:0>16}\n", .{back});
     try out.print("  round-trip ok: {}\n", .{back == pan});
     try out.flush();
-}
-
-test "demo encrypt/decrypt is consistent" {
-    const n: u8 = 6;
-    const t: u8 = 6;
-    const q: u128 = 10_000_000_000_000_000;
-    const rounds = alf.alf_nt.roundCount(n, t);
-
-    const key: [16]u8 = @splat(0x42);
-    const tweak: [16]u8 = @splat(0x07);
-
-    var enc_rk: [alf.alf_nt.max_rounds]alf.Block = undefined;
-    alf.ktm.alfNtRoundKeys(n, rounds, key, tweak, 0xCAFE_F00D, q, enc_rk[0..rounds]);
-    var dec_rk: [alf.alf_nt.max_rounds]alf.Block = undefined;
-    alf.alf_nt.prepareDecryption(n, enc_rk[0..rounds], dec_rk[0..rounds]);
-
-    const pan: u128 = 4111_1111_1111_1111;
-    const cipher_pan = try alf.fpe.encryptInt(n, t, q, enc_rk[0..rounds], pan);
-    try std.testing.expect(cipher_pan < q);
-    const back = try alf.fpe.decryptInt(n, t, q, dec_rk[0..rounds], cipher_pan);
-    try std.testing.expectEqual(pan, back);
 }

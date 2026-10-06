@@ -1,18 +1,14 @@
-//! BinPRNG and ModPRNG used by ALF-L.
+//! The two generators behind ALF-L (Appendix F.4.1 of the ALF paper).
 //!
-//! `BinPRNG` is the Rocca-S keystream (Algorithm 6 of the ALF paper): a
-//! seven-register, AES-NI-based state that emits 256 bits per call. `ModPRNG`
-//! (Algorithm 7) layers an unbiased rejection sampler on top of `BinPRNG` to
-//! produce a stream of integers each modulo a per-position bound q_i ≤ 2^16.
-//!
-//! For ALF-L use, the initial state of `BinPRNG` is supplied by the KTM (see
-//! `ktm.zig`).
+//! `BinPrng` produces random bits, 256 at a time.
+//! `ModPrng` turns them into numbers below given moduli, without bias.
 
 const std = @import("std");
 const aes_core = std.crypto.core.aes;
 
 pub const Block = aes_core.Block;
 
+/// The keystream of the Rocca-S cipher (Algorithm 6 of the paper).
 pub const BinPrng = struct {
     s: [7]Block,
 
@@ -20,7 +16,6 @@ pub const BinPrng = struct {
         return .{ .s = state };
     }
 
-    /// Emit 32 bytes (Z0 || Z1) and advance the state per Algorithm 6.
     pub fn next(self: *BinPrng) [32]u8 {
         const zero_bytes: [16]u8 = @splat(0);
         const zero = Block.fromBytes(&zero_bytes);
@@ -39,80 +34,83 @@ pub const BinPrng = struct {
         self.s = ns;
 
         var out: [32]u8 = undefined;
-        @memcpy(out[0..16], &z0.toBytes());
-        @memcpy(out[16..32], &z1.toBytes());
+        out[0..16].* = z0.toBytes();
+        out[16..32].* = z1.toBytes();
         return out;
     }
 };
 
-/// Generate one 16-bit sample uniformly in [0, q) using the BinPRNG.
-/// Lemire-style: draw a 16-bit value, multiply by q to land in a 32-bit
-/// product, retain the high 16 bits as a candidate, retry when the low 16
-/// bits fall below `(2^16 mod q)` to avoid bias.
-pub fn modSample16(prng: *BinPrng, pool: *Pool32, q: u32) u16 {
-    if (q == 0 or q >= (1 << 16)) {
-        // q = 0 in the paper means modulus 2^16, return raw bits.
-        const r = pool.next16(prng);
-        return r;
-    }
-    const bias = ((@as(u32, 1) << 16) % q);
-    while (true) {
-        const r: u32 = pool.next16(prng);
-        const m = r * q;
-        const low: u32 = m & 0xffff;
-        if (low >= bias) return @intCast(m >> 16);
-    }
+/// Moduli are stored in 16 bits, with 0 standing for 2^16.
+pub fn fullModulus(q: u16) u32 {
+    return if (q == 0) 1 << 16 else q;
 }
 
-/// Small reservoir of 16-bit halves consumed by `modSample16`. Each call to
-/// `next16` pulls a 16-bit chunk from the cached 256-bit BinPRNG output,
-/// refilling on demand. This is the scalar fall-back path of ModPRNG's loop.
-pub const Pool32 = struct {
-    buf: [32]u8 = undefined,
-    pos: u8 = 32,
+/// Algorithm 7 of the paper.
+/// Numbers come out 16 at a time.
+pub const ModPrng = struct {
+    bin: BinPrng,
+    pool: [8]u32 = undefined,
+    pool_used: usize = 8,
 
-    pub fn next16(self: *Pool32, prng: *BinPrng) u16 {
-        if (self.pos + 2 > 32) {
-            self.buf = prng.next();
-            self.pos = 0;
+    pub const block_len = 16;
+
+    pub fn init(state: [7]Block) ModPrng {
+        return .{ .bin = .init(state) };
+    }
+
+    /// One number in [0, q) for each modulus in `qs`, at most 16 of them.
+    pub fn nextBlock(self: *ModPrng, qs: []const u16, samples: []u16) void {
+        std.debug.assert(qs.len == samples.len and qs.len <= block_len);
+        const low = self.bin.next();
+        const high = self.bin.next();
+        for (qs, samples, 0..) |q16, *sample, j| {
+            const q: u64 = fullModulus(q16);
+            const l: u64 = std.mem.readInt(u16, low[2 * j ..][0..2], .little);
+            const h: u64 = std.mem.readInt(u16, high[2 * j ..][0..2], .little);
+            var m = ((h << 16) | l) * q;
+
+            // The sample is the top of the product.
+            // It is slightly biased when the low 32 bits are very small, so draw again in that case.
+            if (@as(u32, @truncate(m)) < q) {
+                const threshold = (1 << 32) % q;
+                while (@as(u32, @truncate(m)) < threshold) m = q * self.pooled();
+            }
+            sample.* = @intCast(m >> 32);
         }
-        const v = std.mem.readInt(u16, self.buf[self.pos..][0..2], .little);
-        self.pos += 2;
-        return v;
+    }
+
+    /// Spare random words for the redraws.
+    fn pooled(self: *ModPrng) u32 {
+        if (self.pool_used == self.pool.len) {
+            const z = self.bin.next();
+            for (&self.pool, 0..) |*word, k| word.* = std.mem.readInt(u32, z[4 * k ..][0..4], .little);
+            self.pool_used = 0;
+        }
+        defer self.pool_used += 1;
+        return self.pool[self.pool_used];
     }
 };
 
-/// ModPRNG: generate N samples si ∈ [0, q_i). qs.len must equal samples.len.
-/// `qs[i] = 0` is interpreted as modulus 2^16 (per the spec's API convention).
-pub fn modPrng(prng: *BinPrng, qs: []const u16, samples: []u16) void {
-    std.debug.assert(qs.len == samples.len);
-    var pool: Pool32 = .{};
-    for (qs, samples) |q, *s| s.* = modSample16(prng, &pool, q);
-}
-
-test "BinPRNG deterministic from a fixed state" {
+test "ModPrng stays in range and redraws biased samples" {
     var s: [7]Block = undefined;
     for (&s, 0..) |*b, i| {
-        var bytes: [16]u8 = undefined;
-        for (&bytes, 0..) |*x, j| x.* = @intCast((i * 16 + j) & 0xff);
+        const bytes: [16]u8 = @splat(@intCast(i + 1));
         b.* = Block.fromBytes(&bytes);
     }
-    var p1 = BinPrng.init(s);
-    var p2 = BinPrng.init(s);
-    try std.testing.expectEqualSlices(u8, &p1.next(), &p2.next());
-    try std.testing.expectEqualSlices(u8, &p1.next(), &p2.next());
-}
+    var prng = ModPrng.init(s);
+    var plain = BinPrng.init(s);
 
-test "ModPRNG produces samples within bounds" {
-    var s: [7]Block = undefined;
-    for (&s, 0..) |*b, i| {
-        var bytes: [16]u8 = undefined;
-        for (&bytes, 0..) |*x, j| x.* = @intCast((i * 16 + j + 1) & 0xff);
-        b.* = Block.fromBytes(&bytes);
+    // No modulus needs redraws more often than 65175, and even then only once in 2^16 samples.
+    const q = 65175;
+    const qs: [16]u16 = @splat(q);
+    var samples: [16]u16 = undefined;
+    for (0..1 << 15) |_| {
+        prng.nextBlock(&qs, &samples);
+        for (samples) |sample| try std.testing.expect(sample < q);
+        _ = plain.next();
+        _ = plain.next();
     }
-    var prng = BinPrng.init(s);
-    const qs = [_]u16{ 10, 100, 1000, 60000, 256, 7, 13, 1 };
-    var samples: [qs.len]u16 = undefined;
-    modPrng(&prng, &qs, &samples);
-    for (qs, samples) |q, sample| try std.testing.expect(sample < q);
+
+    // A redraw uses extra random bits, so the two generators are no longer in step.
+    try std.testing.expect(!std.mem.eql(u8, &prng.bin.next(), &plain.next()));
 }

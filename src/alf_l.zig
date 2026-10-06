@@ -1,316 +1,304 @@
-//! ALF-L: length- and format-preserving encryption of a vector of 16-bit
-//! plaintext symbols (p_0, ..., p_{N-1}) with per-position moduli (q_0, ...,
-//! q_{N-1}). Appendix F.4 of the ALF paper.
+//! ALF on a vector of 16-bit symbols, each in [0, q_i) (Appendix F.4 of the ALF paper).
 //!
-//! The first λ symbols are packed into a 128..144-bit integer X (with Q_λ ≤
-//! 2^144 maximised); the remainder Y = (p_λ, ..., p_{N-1}) is encrypted by an
-//! additive ModPRNG keystream. The 5-step A-B-A-B-A scheme cross-feeds the
-//! two halves: each A step re-keys ALF-16-t from the current Y via the KTM,
-//! and each B step re-seeds ModPRNG from the current X.
+//! As many leading symbols as possible are packed into one integer X, up to 144 bits.
+//! If the whole vector fits, X is encrypted as a single integer.
+//!
+//! Otherwise this is ALF-L.
+//! The remaining symbols form Y, and five layers alternate:
+//! X is encrypted with a key that depends on Y, then Y is masked with a keystream that depends on X.
 
 const std = @import("std");
-const aes_core = std.crypto.core.aes;
 const ktm = @import("ktm.zig");
-const alf16t = @import("alf_16t.zig");
+const alf_int = @import("alf_int.zig");
+const alf_16t = @import("alf_16t.zig");
 const prng = @import("prng.zig");
 
-pub const Block = aes_core.Block;
+pub const Block = ktm.Block;
 
-pub const Error = alf16t.Error || error{
+pub const Error = error{
     EmptyInput,
-    XPartOutOfRange,
-    YModulusOutOfRange,
-    InvalidLambda,
+    LengthMismatch,
+    SymbolOutOfRange,
+    TooLong,
 };
 
-/// Split (q_0, ..., q_{N-1}) into the largest prefix λ whose product Q_λ is
-/// at most 2^144, and return (λ, Q_λ).
-pub fn selectLambda(qs: []const u16) struct { lambda: u32, q_lambda: u160 } {
-    var q: u160 = 1;
-    var lam: u32 = 0;
-    for (qs) |qi| {
-        const norm: u160 = if (qi == 0) (@as(u160, 1) << 16) else qi;
-        const next: u160 = q * norm;
-        if (next > (@as(u160, 1) << 144)) break;
-        q = next;
-        lam += 1;
+/// Largest modulus of the packed part X.
+pub const max_packed_modulus = alf_int.max_modulus;
+
+/// Largest number of symbols in a vector.
+pub const max_len = std.math.maxInt(u48);
+
+/// The moduli of a vector.
+/// A modulus of 0 stands for 2^16.
+///
+/// For more than one symbol, `same` and `distinct` give unrelated ciphertexts,
+/// even if every entry of the `distinct` list is equal.
+pub const Moduli = union(enum) {
+    same: u16,
+    distinct: []const u16,
+
+    fn at(self: Moduli, i: usize) u32 {
+        return prng.fullModulus(switch (self) {
+            .same => |q| q,
+            .distinct => |qs| qs[i],
+        });
     }
-    return .{ .lambda = lam, .q_lambda = q };
+
+    fn from(self: Moduli, start: usize) Moduli {
+        return switch (self) {
+            .same => self,
+            .distinct => |qs| .{ .distinct = qs[start..] },
+        };
+    }
+};
+
+pub const Split = struct { lambda: usize, q_lambda: u160 };
+
+/// How many leading symbols of an n-symbol vector are packed into X,
+/// and the product of their moduli.
+/// A `distinct` list must have at least n entries.
+pub fn selectLambda(moduli: Moduli, n: usize) Split {
+    if (moduli == .distinct) std.debug.assert(moduli.distinct.len >= n);
+    var q: u160 = 1;
+    var lambda: usize = 0;
+    while (lambda < n) : (lambda += 1) {
+        const next = std.math.mul(u160, q, moduli.at(lambda)) catch break;
+        if (next > max_packed_modulus) break;
+        q = next;
+    }
+    return .{ .lambda = lambda, .q_lambda = q };
 }
 
-/// Pack the first λ symbols into a mixed-radix integer.
-pub fn packX(ps: []const u16, qs: []const u16, lambda: u32) u160 {
-    std.debug.assert(ps.len >= lambda and qs.len >= lambda);
-    if (lambda == 0) return 0;
-    var x: u160 = ps[0];
-    var i: u32 = 1;
-    while (i < lambda) : (i += 1) {
-        const norm: u160 = if (qs[i] == 0) (@as(u160, 1) << 16) else qs[i];
-        x = x * norm + ps[i];
-    }
+fn packX(symbols: []const u16, moduli: Moduli) u160 {
+    var x: u160 = 0;
+    for (symbols, 0..) |p, i| x = x * moduli.at(i) + p;
     return x;
 }
 
-/// Inverse of `packX`: writes the first λ symbols of `out` from the packed X.
-pub fn unpackX(x_in: u160, qs: []const u16, lambda: u32, out: []u16) void {
-    std.debug.assert(out.len >= lambda and qs.len >= lambda);
-    if (lambda == 0) return;
+/// Divide x by d, for d up to 2^32, and return the remainder.
+/// A plain 160-bit division is several times slower.
+fn divRem(x: *u160, d: u64) u64 {
+    var rem: u64 = 0;
+    var quotient: u160 = 0;
+    comptime var shift = 128;
+    inline while (shift >= 0) : (shift -= 32) {
+        const cur = (rem << 32) | @as(u32, @truncate(x.* >> shift));
+        quotient |= @as(u160, cur / d) << shift;
+        rem = cur % d;
+    }
+    x.* = quotient;
+    return rem;
+}
+
+fn unpackX(x_in: u160, moduli: Moduli, out: []u16) void {
     var x = x_in;
-    var i = lambda;
-    while (i > 1) {
-        i -= 1;
-        const norm: u160 = if (qs[i] == 0) (@as(u160, 1) << 16) else qs[i];
-        out[i] = @intCast(x % norm);
-        x /= norm;
-    }
-    out[0] = @intCast(x);
-}
+    var end = out.len;
+    while (end > 0) {
+        // Handle the trailing symbols that fit in 32 bits together,
+        // so that X is divided once per group and not once per symbol.
+        var start = end;
+        var group_modulus: u64 = 1;
+        while (start > 0) : (start -= 1) {
+            const next = group_modulus * moduli.at(start - 1);
+            if (next > 1 << 32) break;
+            group_modulus = next;
+        }
+        var group = divRem(&x, group_modulus);
 
-/// Derive ALF-16-t round keys for layer A_j from the KTM state + current Y.
-fn deriveAKeys(post_tweak: ktm.State, y: []const u16, d: u8, out: *[12]Block) void {
-    const state = ktm.sCompress(post_tweak, y);
-    var buf: [12 * 16]u8 = undefined;
-    ktm.deriveBytes(state, d, &buf);
-    for (out, 0..) |*rk, i| rk.* = Block.fromBytes(buf[i * 16 ..][0..16]);
-}
-
-/// Initialise ModPRNG state for layer B_j from the KTM state + current X.
-fn deriveBState(post_tweak: ktm.State, x: u160, d: u8) prng.BinPrng {
-    const x_lo: u128 = @truncate(x);
-    var x_lo_bytes: [16]u8 = undefined;
-    std.mem.writeInt(u128, &x_lo_bytes, x_lo, .little);
-
-    const state = ktm.smacR(post_tweak, Block.fromBytes(&x_lo_bytes));
-    const x_hi: u16 = @intCast(x >> 128);
-
-    var picked: [3 * 48]u8 = undefined;
-    var c: u8 = 1;
-    while (c <= 3) : (c += 1) {
-        const param: u32 = (@as(u32, x_hi) << 16) | (@as(u32, d) << 8) | c;
-        const s = ktm.initFinal(state, param);
-        const off = (c - 1) * 48;
-        @memcpy(picked[off..][0..16], &s.a1.toBytes());
-        @memcpy(picked[off + 16 ..][0..16], &s.a2.toBytes());
-        @memcpy(picked[off + 32 ..][0..16], &s.a3.toBytes());
-    }
-    var seeds: [7]Block = undefined;
-    for (&seeds, 0..) |*b, i| b.* = Block.fromBytes(picked[i * 16 ..][0..16]);
-    return prng.BinPrng.init(seeds);
-}
-
-fn encryptYInPlace(prng_state: *prng.BinPrng, y: []u16, qs: []const u16) void {
-    std.debug.assert(y.len == qs.len);
-    var pool: prng.Pool32 = .{};
-    for (y, qs) |*yv, q| {
-        const sample = prng.modSample16(prng_state, &pool, q);
-        const sum: u32 = @as(u32, yv.*) + sample;
-        const q_norm: u32 = if (q == 0) (1 << 16) else q;
-        yv.* = @intCast(sum % q_norm);
+        var i = end;
+        while (i > start) {
+            i -= 1;
+            const q = moduli.at(i);
+            out[i] = @intCast(group % q);
+            group /= q;
+        }
+        end = start;
     }
 }
 
-fn decryptYInPlace(prng_state: *prng.BinPrng, y: []u16, qs: []const u16) void {
-    std.debug.assert(y.len == qs.len);
-    var pool: prng.Pool32 = .{};
-    for (y, qs) |*yv, q| {
-        const sample = prng.modSample16(prng_state, &pool, q);
-        const q_norm: u32 = if (q == 0) (1 << 16) else q;
-        const diff: u32 = (@as(u32, yv.*) + q_norm - @as(u32, sample)) % q_norm;
-        yv.* = @intCast(diff);
+fn domain(moduli: Moduli, n: usize) ktm.Domain {
+    if (n == 1) return .{ .integer = moduli.at(0) };
+    return switch (moduli) {
+        .same => |q| .{ .same = .{ .n = @intCast(n), .q = q } },
+        .distinct => |qs| .{ .distinct = qs },
+    };
+}
+
+/// Round keys for encrypting X, bound to the current Y.
+fn layerAKeys(tweaked: ktm.State, y: []const u16, d: u8) [alf_16t.rounds]Block {
+    var s = ktm.smacR(tweaked, Block.fromBytes(&ktm.one_star));
+    s = ktm.sCompress(s, y);
+    var round_keys: [alf_16t.rounds]Block = undefined;
+    ktm.deriveRoundKeys(16, alf_16t.rounds, s, d, &round_keys);
+    return round_keys;
+}
+
+/// Keystream generator for masking Y, bound to the current X.
+fn layerBPrng(tweaked: ktm.State, x: u160, d: u8) prng.ModPrng {
+    var x_lo: [16]u8 = undefined;
+    std.mem.writeInt(u128, &x_lo, @truncate(x), .little);
+    const s = ktm.smacR(tweaked, Block.fromBytes(&x_lo));
+
+    const x_hi: u32 = @intCast(x >> 128);
+    var f: [3]ktm.State = undefined;
+    for (&f, 1..) |*out, c| out.* = ktm.initFinal(s, (x_hi << 16) | (@as(u32, d) << 8) | @as(u32, @intCast(c)));
+
+    // The paper leaves out the first block of the first two outputs.
+    return .init(.{ f[0].a2, f[0].a3, f[1].a2, f[1].a3, f[2].a1, f[2].a2, f[2].a3 });
+}
+
+const Direction = enum { encrypt, decrypt };
+
+fn applyCipher(comptime dir: Direction, cipher: *const alf_int.Cipher, x: u160) u160 {
+    return (if (dir == .encrypt) cipher.encrypt(x) else cipher.decrypt(x)) catch unreachable;
+}
+
+fn applyKeystream(comptime dir: Direction, generator: *prng.ModPrng, y: []u16, moduli: Moduli) void {
+    const block_len = prng.ModPrng.block_len;
+    var shared: [block_len]u16 = undefined;
+    if (moduli == .same) @memset(&shared, moduli.same);
+
+    var i: usize = 0;
+    while (i < y.len) : (i += block_len) {
+        const count = @min(block_len, y.len - i);
+        const qs = switch (moduli) {
+            .same => shared[0..count],
+            .distinct => |all| all[i..][0..count],
+        };
+        var samples: [block_len]u16 = undefined;
+        generator.nextBlock(qs, samples[0..count]);
+        for (y[i..][0..count], samples[0..count], qs) |*symbol, sample, q16| {
+            const q = prng.fullModulus(q16);
+            symbol.* = @intCast(switch (dir) {
+                .encrypt => (@as(u32, symbol.*) + sample) % q,
+                .decrypt => (@as(u32, symbol.*) + q - sample) % q,
+            });
+        }
     }
 }
 
-/// Encrypt a single ALF-L plaintext vector. `qs` provides per-position moduli
-/// (1..2^16; the value 0 is interpreted as 2^16 per Appendix F.4). `out` must
-/// have the same length as `plaintext`.
+fn validate(moduli: Moduli, input: []const u16, out: []const u16) Error!void {
+    if (input.len == 0) return error.EmptyInput;
+    if (out.len != input.len) return error.LengthMismatch;
+    if (input.len > max_len) return error.TooLong;
+    if (moduli == .distinct and moduli.distinct.len != input.len) return error.LengthMismatch;
+    for (input, 0..) |p, i| {
+        if (p >= moduli.at(i)) return error.SymbolOutOfRange;
+    }
+}
+
+fn crypt(
+    comptime dir: Direction,
+    key: [16]u8,
+    tweak: [16]u8,
+    app_id: u64,
+    moduli: Moduli,
+    input: []const u16,
+    out: []u16,
+) Error!void {
+    try validate(moduli, input, out);
+
+    const n = input.len;
+    const split = selectLambda(moduli, n);
+    const lambda = split.lambda;
+    const q = split.q_lambda;
+    const state = ktm.keyInit(key, app_id, domain(moduli, n));
+
+    var x = packX(input[0..lambda], moduli);
+    if (lambda < n) {
+        const y = out[lambda..];
+        if (y.ptr != input[lambda..].ptr) @memcpy(y, input[lambda..]);
+        const y_moduli = moduli.from(lambda);
+        const tweaked = ktm.tweakCompress(state, tweak);
+
+        const layers: [5]u8 = switch (dir) {
+            .encrypt => .{ 1, 2, 3, 4, 5 },
+            .decrypt => .{ 5, 4, 3, 2, 1 },
+        };
+        for (layers) |d| {
+            if (d % 2 == 1) {
+                // X is full here, so its modulus is in the range ALF-16-t accepts.
+                const cipher = alf_int.Cipher.fromAlf16tKeys(q, layerAKeys(tweaked, y, d)) catch unreachable;
+                x = applyCipher(dir, &cipher, x);
+            } else {
+                var generator = layerBPrng(tweaked, x, d);
+                applyKeystream(dir, &generator, y, y_moduli);
+            }
+        }
+    } else if (q > 1) {
+        const cipher = alf_int.Cipher.fromState(state, tweak, q) catch unreachable;
+        x = applyCipher(dir, &cipher, x);
+    }
+    unpackX(x, moduli, out[0..lambda]);
+}
+
+/// Encrypt a vector of symbols into a vector with the same moduli.
+///
+/// `out` can be the same slice as `plaintext`.
+/// Any other overlap is not allowed.
 pub fn encrypt(
     key: [16]u8,
     tweak: [16]u8,
     app_id: u64,
-    qs: []const u16,
+    moduli: Moduli,
     plaintext: []const u16,
     out: []u16,
 ) Error!void {
-    if (plaintext.len == 0) return error.EmptyInput;
-    if (plaintext.len != qs.len or out.len != qs.len) return error.YModulusOutOfRange;
-    for (plaintext, qs) |p, q| {
-        const q_norm: u32 = if (q == 0) (1 << 16) else q;
-        if (@as(u32, p) >= q_norm) return error.XPartOutOfRange;
-    }
-
-    const sel = selectLambda(qs);
-    const lambda = sel.lambda;
-    const q_lambda = sel.q_lambda;
-    if (lambda == 0) return error.InvalidLambda;
-
-    // KTM: KeyInit absorbs (Q-1, N, AppID, key, q-vector) then tweak compress.
-    const state = ktm.keyInit(key, app_id, @intCast(plaintext.len), @intCast(q_lambda - 1), qs);
-    const post_tweak = ktm.tweakCompress(state, tweak);
-
-    var x = packX(plaintext, qs, lambda);
-
-    // Y mutates across the B layers; allocate working copy.
-    var y_storage: [256]u16 = undefined;
-    const y_len = plaintext.len - lambda;
-    std.debug.assert(y_len <= y_storage.len);
-    const y = y_storage[0..y_len];
-    @memcpy(y, plaintext[lambda..]);
-    const y_qs = qs[lambda..];
-
-    if (q_lambda <= (@as(u160, 1) << 127)) return error.InvalidLambda;
-    const t_used: u8 = @intCast(160 - @clz(q_lambda - 1) - 128);
-
-    try runLayerA(post_tweak, t_used, q_lambda, &x, y, 1);
-    try runLayerB(post_tweak, x, y, y_qs, 2);
-    try runLayerA(post_tweak, t_used, q_lambda, &x, y, 3);
-    try runLayerB(post_tweak, x, y, y_qs, 4);
-    try runLayerA(post_tweak, t_used, q_lambda, &x, y, 5);
-
-    unpackX(x, qs, lambda, out[0..lambda]);
-    @memcpy(out[lambda..], y);
+    return crypt(.encrypt, key, tweak, app_id, moduli, plaintext, out);
 }
 
-/// Decrypt a single ALF-L ciphertext vector. Reverses the A-B-A-B-A pipeline.
+/// Inverse of `encrypt`.
 pub fn decrypt(
     key: [16]u8,
     tweak: [16]u8,
     app_id: u64,
-    qs: []const u16,
+    moduli: Moduli,
     ciphertext: []const u16,
     out: []u16,
 ) Error!void {
-    if (ciphertext.len == 0) return error.EmptyInput;
-    if (ciphertext.len != qs.len or out.len != qs.len) return error.YModulusOutOfRange;
-    for (ciphertext, qs) |c, q| {
-        const q_norm: u32 = if (q == 0) (1 << 16) else q;
-        if (@as(u32, c) >= q_norm) return error.XPartOutOfRange;
-    }
-
-    const sel = selectLambda(qs);
-    const lambda = sel.lambda;
-    const q_lambda = sel.q_lambda;
-    if (lambda == 0) return error.InvalidLambda;
-    if (q_lambda <= (@as(u160, 1) << 127)) return error.InvalidLambda;
-
-    const state = ktm.keyInit(key, app_id, @intCast(ciphertext.len), @intCast(q_lambda - 1), qs);
-    const post_tweak = ktm.tweakCompress(state, tweak);
-
-    var x = packX(ciphertext, qs, lambda);
-
-    var y_storage: [256]u16 = undefined;
-    const y_len = ciphertext.len - lambda;
-    std.debug.assert(y_len <= y_storage.len);
-    const y = y_storage[0..y_len];
-    @memcpy(y, ciphertext[lambda..]);
-    const y_qs = qs[lambda..];
-
-    const t_used: u8 = @intCast(160 - @clz(q_lambda - 1) - 128);
-
-    try runLayerAInverse(post_tweak, t_used, q_lambda, &x, y, 5);
-    try runLayerBInverse(post_tweak, x, y, y_qs, 4);
-    try runLayerAInverse(post_tweak, t_used, q_lambda, &x, y, 3);
-    try runLayerBInverse(post_tweak, x, y, y_qs, 2);
-    try runLayerAInverse(post_tweak, t_used, q_lambda, &x, y, 1);
-
-    unpackX(x, qs, lambda, out[0..lambda]);
-    @memcpy(out[lambda..], y);
+    return crypt(.decrypt, key, tweak, app_id, moduli, ciphertext, out);
 }
 
-inline fn runLayerA(
-    post_tweak: ktm.State,
-    t: u8,
-    q_lambda: u160,
-    x: *u160,
-    y: []const u16,
-    d: u8,
-) !void {
-    var rk: [alf16t.rounds]Block = undefined;
-    deriveAKeys(post_tweak, y, d, &rk);
-    x.* = switch (t) {
-        inline 0...16 => |ti| try alf16t.encryptInt(ti, q_lambda, &rk, x.*),
-        else => return error.InvalidLambda,
-    };
+const test_key: [16]u8 = @splat(0xa5);
+const test_tweak: [16]u8 = @splat(0x5a);
+
+test "selectLambda fills X up to 2^144" {
+    const expectEqual = std.testing.expectEqual;
+    const full = max_packed_modulus;
+
+    try expectEqual(Split{ .lambda = 9, .q_lambda = full }, selectLambda(.{ .same = 0 }, 256));
+    try expectEqual(Split{ .lambda = 16, .q_lambda = 10_000_000_000_000_000 }, selectLambda(.{ .same = 10 }, 16));
+
+    // Moduli of 1 take no room, so they still fit once X is full.
+    const qs = [_]u16{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 1 };
+    try expectEqual(Split{ .lambda = 11, .q_lambda = full }, selectLambda(.{ .distinct = &qs }, qs.len));
 }
 
-inline fn runLayerAInverse(
-    post_tweak: ktm.State,
-    t: u8,
-    q_lambda: u160,
-    x: *u160,
-    y: []const u16,
-    d: u8,
-) !void {
-    var rk: [alf16t.rounds]Block = undefined;
-    deriveAKeys(post_tweak, y, d, &rk);
-    var dec_rk: [alf16t.rounds]Block = undefined;
-    alf16t.prepareDecryption(&rk, &dec_rk);
-    x.* = switch (t) {
-        inline 0...16 => |ti| try alf16t.decryptInt(ti, q_lambda, &dec_rk, x.*),
-        else => return error.InvalidLambda,
-    };
-}
+test "separate buffers, and same versus distinct moduli" {
+    const ps: [40]u16 = @splat(5);
+    const qs: [40]u16 = @splat(26);
 
-inline fn runLayerB(
-    post_tweak: ktm.State,
-    x: u160,
-    y: []u16,
-    y_qs: []const u16,
-    d: u8,
-) !void {
-    var prng_state = deriveBState(post_tweak, x, d);
-    encryptYInPlace(&prng_state, y, y_qs);
-}
-
-inline fn runLayerBInverse(
-    post_tweak: ktm.State,
-    x: u160,
-    y: []u16,
-    y_qs: []const u16,
-    d: u8,
-) !void {
-    var prng_state = deriveBState(post_tweak, x, d);
-    decryptYInPlace(&prng_state, y, y_qs);
-}
-
-test "pack/unpack round-trip" {
-    const qs = [_]u16{ 10, 100, 16, 65535, 23 };
-    const ps = [_]u16{ 7, 42, 9, 1234, 17 };
-    const packed_x = packX(&ps, &qs, qs.len);
-    var out: [5]u16 = undefined;
-    unpackX(packed_x, &qs, qs.len, &out);
-    try std.testing.expectEqualSlices(u16, &ps, &out);
-}
-
-test "selectLambda stops at 2^144" {
-    const qs = [_]u16{ 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535 };
-    const sel = selectLambda(&qs);
-    try std.testing.expect(sel.lambda <= 9);
-    try std.testing.expect(sel.q_lambda <= (@as(u160, 1) << 144));
-}
-
-test "ALF-L round-trip with mixed moduli" {
-    @setEvalBranchQuota(20_000);
-    const qs = [_]u16{
-        // First 9 push Q_lambda over 2^127 but under 2^144.
-        60000, 60000, 60000, 60000, 60000, 60000, 60000, 60000, 60000,
-        // Remaining live in the Y tail.
-        1000,  256,   10000, 50000, 1234,
-    };
-    const ps = [_]u16{
-        12345, 33333, 1,    59999, 55555, 11111, 42, 7777, 32768,
-        500,   100,   9999, 12345, 999,
-    };
-    const key: [16]u8 = .{ 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a };
-    const tweak: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-
-    var ct: [ps.len]u16 = undefined;
-    try encrypt(key, tweak, 0xdeadbeefcafef00d, &qs, &ps, &ct);
-    for (ct, qs) |c, q| {
-        const q_norm: u32 = if (q == 0) (1 << 16) else q;
-        try std.testing.expect(@as(u32, c) < q_norm);
-    }
+    var separate: [ps.len]u16 = undefined;
+    var in_place = ps;
+    try encrypt(test_key, test_tweak, 0, .{ .same = 26 }, &ps, &separate);
+    try encrypt(test_key, test_tweak, 0, .{ .same = 26 }, &in_place, &in_place);
+    try std.testing.expectEqualSlices(u16, &separate, &in_place);
 
     var back: [ps.len]u16 = undefined;
-    try decrypt(key, tweak, 0xdeadbeefcafef00d, &qs, &ct, &back);
+    try decrypt(test_key, test_tweak, 0, .{ .same = 26 }, &separate, &back);
     try std.testing.expectEqualSlices(u16, &ps, &back);
+
+    var distinct: [ps.len]u16 = undefined;
+    try encrypt(test_key, test_tweak, 0, .{ .distinct = &qs }, &ps, &distinct);
+    try std.testing.expect(!std.mem.eql(u16, &separate, &distinct));
+}
+
+test "invalid inputs are rejected" {
+    const expectError = std.testing.expectError;
+    var out: [3]u16 = undefined;
+    try expectError(error.EmptyInput, encrypt(test_key, test_tweak, 0, .{ .same = 10 }, &.{}, out[0..0]));
+    try expectError(error.LengthMismatch, encrypt(test_key, test_tweak, 0, .{ .same = 10 }, &.{ 1, 2 }, &out));
+    try expectError(error.LengthMismatch, encrypt(test_key, test_tweak, 0, .{ .distinct = &.{ 10, 10 } }, &.{ 1, 2, 3 }, &out));
+    try expectError(error.SymbolOutOfRange, encrypt(test_key, test_tweak, 0, .{ .same = 10 }, &.{ 1, 10, 3 }, &out));
+    try expectError(error.SymbolOutOfRange, decrypt(test_key, test_tweak, 0, .{ .distinct = &.{ 10, 2, 10 } }, &.{ 1, 2, 3 }, &out));
 }

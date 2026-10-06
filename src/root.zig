@@ -1,17 +1,18 @@
-//! ALF cipher family: AES-NI-based length- and format-preserving encryption.
+//! The ALF family of format-preserving ciphers, built on AES rounds.
 //!
-//! The umbrella module re-exports each variant.
+//! Start here:
 //!
-//! * `alf_nt` — main length-preserving block cipher of width (8n + t) bits
-//!   for n ∈ [2, 15], t ∈ [0, 7] (16..127 bits).
-//! * `fpe` — cycle-sliding wrapper turning `alf_nt` into a format-preserving
-//!   cipher for any modulus Q ∈ (2^15, 2^127].
-//! * `alf_small` — ALF-0 (Q ∈ [2, 256]) and ALF-1-t (9..15 bits).
-//! * `alf_16t` — ALF-16-t (128..144 bits, Q up to 2^144).
-//! * `alf_l` — vector cipher for arbitrary-length plaintexts with per-position
-//!   moduli, built on ALF-16-t plus a Rocca-S-based ModPRNG keystream.
-//! * `ktm` — Key-Tweak Management (SMAC-3/4 based round-key generator).
-//! * `prng` — BinPRNG / ModPRNG used by ALF-L.
+//! * `alf_int` encrypts one integer in [0, Q), for any Q up to 2^144.
+//! * `alf_l` encrypts a vector of 16-bit symbols, each with its own modulus.
+//!
+//! Both pick the right cipher for the size of the domain.
+//! The pieces they are made of:
+//!
+//! * `alf_small`: ALF-0 and ALF-1-t, for Q up to 2^15.
+//! * `alf_nt` and `fpe`: ALF-n-t, for 16 to 127 bits.
+//! * `alf_16t`: ALF-16-t, for 128 to 144 bits.
+//! * `ktm`: turns the key and the tweak into round keys.
+//! * `prng`: the keystream used for long vectors.
 
 const std = @import("std");
 
@@ -20,6 +21,7 @@ pub const alf_nt = @import("alf_nt.zig");
 pub const fpe = @import("fpe.zig");
 pub const alf_small = @import("alf_small.zig");
 pub const alf_16t = @import("alf_16t.zig");
+pub const alf_int = @import("alf_int.zig");
 pub const alf_l = @import("alf_l.zig");
 pub const ktm = @import("ktm.zig");
 pub const prng = @import("prng.zig");
@@ -28,4 +30,5 @@ pub const Block = alf_nt.Block;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("kat_test.zig");
 }

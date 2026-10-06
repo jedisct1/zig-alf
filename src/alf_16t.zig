@@ -1,9 +1,9 @@
-//! ALF-16-t: AES-NI-based length-preserving block cipher of width (128 + t)
-//! bits, t ∈ [0, 16]. Format-preserving for any Q ∈ (2^127, 2^144].
+//! ALF-16-t: a block cipher on (128 + t) bits, with t in [0, 16].
+//! It also encrypts integers modulo any Q in (2^127, 2^144].
 //!
-//! Twelve full AES rounds form the core. Each round mixes a 16-bit auxiliary
-//! register E into the first two columns of the AES state via column parity,
-//! mirroring the (α, β, ρ) trick of ALF-n-t but without per-n shuffles.
+//! Twelve AES rounds work on the low 128 bits.
+//! The t extra bits are kept in a 16-bit register E,
+//! which is mixed with the first two columns of the AES state at every round.
 
 const std = @import("std");
 const aes_core = std.crypto.core.aes;
@@ -24,7 +24,7 @@ pub fn validate(comptime t: u8) Error!void {
     if (t > 16) return error.InvalidWidthBits;
 }
 
-/// Byte count of an ALF-16-t value: 16 bytes for X plus the bytes needed by E.
+/// Number of bytes a value takes.
 pub fn byteLength(comptime t: u8) u8 {
     return 16 + (t + 7) / 8;
 }
@@ -64,8 +64,7 @@ fn storeInteger(comptime t: u8, v: u160, out: []u8) void {
     }
 }
 
-/// Build the 16-byte "E broadcast" block:
-/// (E0, E0, E0, E0, E1, E1, E1, E1, 0, 0, 0, 0, 0, 0, 0, 0).
+/// The two bytes of E, each repeated over one of the first two columns.
 fn broadcastE(e: u16) Block {
     const e0: u8 = @truncate(e);
     const e1: u8 = @truncate(e >> 8);
@@ -75,7 +74,7 @@ fn broadcastE(e: u16) Block {
     return Block.fromBytes(&bytes);
 }
 
-/// Column parity packed into a single u16: (p1 << 8) | p0.
+/// XOR of the four bytes of each of the first two columns.
 fn columnParity(u: Block) u16 {
     const b = u.toBytes();
     const p0 = b[0] ^ b[1] ^ b[2] ^ b[3];
@@ -83,7 +82,7 @@ fn columnParity(u: Block) u16 {
     return (@as(u16, p1) << 8) | p0;
 }
 
-/// Run two forward rounds of ALF-16-t given a 2-element slice of round keys.
+/// Run one encryption round per key.
 fn forwardRounds(comptime t: u8, round_keys: []const Block, x: *Block, e: *u16) void {
     for (round_keys) |rk| {
         const u = x.encrypt(rk);
@@ -92,10 +91,8 @@ fn forwardRounds(comptime t: u8, round_keys: []const Block, x: *Block, e: *u16) 
     }
 }
 
-/// Run two reverse rounds in reverse order with the *decryption* round keys
-/// (i.e. MC'(RK[i])). The auxiliary `aesenclast` step must already have been
-/// applied to `x`. After this, `x` is in the post-aesdeclast form ready for
-/// either another two-round chunk or the final SRF.
+/// Run one decryption round per key, last key first.
+/// `auxStep` must have been applied to `x` before the first call.
 fn reverseRounds(comptime t: u8, dec_round_keys: []const Block, x: *Block, e: *u16) void {
     const zero_bytes: [16]u8 = @splat(0);
     const zero = Block.fromBytes(&zero_bytes);
@@ -118,13 +115,13 @@ fn srfStep(x: Block) Block {
     return x.decryptLast(Block.fromBytes(&zero_bytes));
 }
 
-/// Transform encryption round keys into decryption round keys: RK'[i] = MC'(RK[i]).
+/// Turn encryption round keys into decryption round keys.
 pub fn prepareDecryption(enc_keys: *const [rounds]Block, dec_keys: *[rounds]Block) void {
     for (enc_keys, dec_keys) |rk, *out| out.* = rk.invMixColumns();
 }
 
-/// FPE encrypt: maps a plaintext in [0, Q) to a ciphertext in [0, Q).
-/// `q` must lie in (2^127, 2^144]; the implied width is t = ⌈log2 q⌉ - 128.
+/// Encrypt an integer in [0, q) to another integer in [0, q).
+/// q must be in (2^127, 2^(128 + t)].
 pub fn encryptInt(
     comptime t: u8,
     q: u160,
@@ -159,7 +156,7 @@ fn combineXE(comptime t: u8, x: Block, e: u16) u160 {
     return v;
 }
 
-/// FPE decrypt: inverse of `encryptInt`.
+/// Inverse of `encryptInt`.
 pub fn decryptInt(
     comptime t: u8,
     q: u160,
@@ -185,18 +182,11 @@ pub fn decryptInt(
             const after_srf = srfStep(x);
             const v: u160 = combineXE(t, after_srf, e);
             if (v < q) {
-                // SRF cancels the next aux step on consecutive iterations, but
-                // when the check passes we need to update x. If this is the
-                // final group, leave x in SRF form; otherwise re-apply aux for
-                // the next group. Equivalently, SRF ∘ aux = I so we can simply
-                // not apply SRF and continue.
+                // The final step is only needed to read the value.
+                // x keeps its internal form until the last pair of rounds is done.
                 if (i == 0) x = after_srf;
                 break;
             }
-            // If the value is out of range we re-run the same 2 reverse rounds
-            // on the current `x`. Since we did *not* apply SRF to `x`, the
-            // next reverseRounds call operates on the post-aesdec form, which
-            // is what it expects.
         }
     }
     return combineXE(t, x, e);
@@ -230,52 +220,6 @@ pub fn decrypt(
     storeInteger(t, pt, plaintext);
 }
 
-test "ALF-16-0 length-preserving round-trip (128-bit cipher)" {
-    var enc_rk: [rounds]Block = undefined;
-    for (&enc_rk, 0..) |*rk, i| {
-        var bytes: [16]u8 = undefined;
-        for (&bytes, 0..) |*b, j| b.* = @intCast((i * 16 + j + 1) & 0xff);
-        rk.* = Block.fromBytes(&bytes);
-    }
-    var dec_rk: [rounds]Block = undefined;
-    prepareDecryption(&enc_rk, &dec_rk);
-
-    var rng = std.Random.DefaultPrng.init(42);
-    const rand = rng.random();
-    for (0..16) |_| {
-        const pt = rand.int(u128);
-        const q: u160 = 1 << 128;
-        const ct = try encryptInt(0, q, &enc_rk, pt);
-        try std.testing.expect(ct < q);
-        const back = try decryptInt(0, q, &dec_rk, ct);
-        try std.testing.expectEqual(@as(u160, pt), back);
-    }
-}
-
-test "ALF-16-t length-preserving for t > 0" {
-    const t: u8 = 12;
-    var enc_rk: [rounds]Block = undefined;
-    for (&enc_rk, 0..) |*rk, i| {
-        var bytes: [16]u8 = undefined;
-        for (&bytes, 0..) |*b, j| b.* = @intCast((i * 7 + j * 3 + 11) & 0xff);
-        rk.* = Block.fromBytes(&bytes);
-    }
-    var dec_rk: [rounds]Block = undefined;
-    prepareDecryption(&enc_rk, &dec_rk);
-
-    var rng = std.Random.DefaultPrng.init(7);
-    const rand = rng.random();
-    const q: u160 = 1 << (128 + t);
-    for (0..16) |_| {
-        var pt: u160 = rand.int(u128);
-        pt |= @as(u160, rand.uintLessThan(u16, @intCast(@as(u32, 1) << t))) << 128;
-        const ct = try encryptInt(t, q, &enc_rk, pt);
-        try std.testing.expect(ct < q);
-        const back = try decryptInt(t, q, &dec_rk, ct);
-        try std.testing.expectEqual(pt, back);
-    }
-}
-
 test "ALF-16-t byte API at t=16 (full 144 bits)" {
     const t: u8 = 16;
     var enc_rk: [rounds]Block = undefined;
@@ -294,31 +238,4 @@ test "ALF-16-t byte API at t=16 (full 144 bits)" {
     try encrypt(t, q, &enc_rk, &pt_bytes, &ct_bytes);
     try decrypt(t, q, &dec_rk, &ct_bytes, &back_bytes);
     try std.testing.expectEqualSlices(u8, &pt_bytes, &back_bytes);
-}
-
-test "ALF-16-t FPE: round-trip with non-power-of-two Q" {
-    const t: u8 = 16;
-    // 144 bits of width, Q slightly below 2^144.
-    const q: u160 = (@as(u160, 1) << 143) + (@as(u160, 1) << 100);
-    var enc_rk: [rounds]Block = undefined;
-    for (&enc_rk, 0..) |*rk, i| {
-        var bytes: [16]u8 = undefined;
-        for (&bytes, 0..) |*b, j| b.* = @intCast((i * 19 + j * 5 + 31) & 0xff);
-        rk.* = Block.fromBytes(&bytes);
-    }
-    var dec_rk: [rounds]Block = undefined;
-    prepareDecryption(&enc_rk, &dec_rk);
-
-    var rng = std.Random.DefaultPrng.init(99);
-    const rand = rng.random();
-    for (0..32) |_| {
-        const r1: u128 = rand.int(u128);
-        const r2: u16 = rand.int(u16);
-        var pt: u160 = @as(u160, r1) | (@as(u160, r2) << 128);
-        pt %= q;
-        const ct = try encryptInt(t, q, &enc_rk, pt);
-        try std.testing.expect(ct < q);
-        const back = try decryptInt(t, q, &dec_rk, ct);
-        try std.testing.expectEqual(pt, back);
-    }
 }

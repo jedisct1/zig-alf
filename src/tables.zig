@@ -1,20 +1,16 @@
-//! Precomputed shuffle and constant tables for ALF-n-t (n in [2, 15]).
+//! Shuffle and constant tables for ALF-n-t, n in [2, 15].
+//! The values come from Appendix C of the ALF paper.
 //!
-//! All vectors are interpreted as PSHUFB control vectors when used with
-//! `shuffle()`: a non-negative byte selects the source byte at that index,
-//! while a negative byte (-1 in the spec, 0xff in two's complement) yields
-//! zero. `constA` holds raw byte values (signed in the spec because they
-//! exceed 127).
-//!
-//! Values are taken from Appendix C of the ALF paper.
+//! Shuffle vectors follow the PSHUFB convention:
+//! an entry picks the source byte at that index, and a negative entry gives zero.
 
-/// Number of supported `n` values. ALF-n-t spans n in [2, 15] inclusive.
+/// Number of supported values of n.
 pub const n_count = 14;
 
-/// Index conversion: table_index = n - n_min.
+/// Tables are indexed by n - n_min.
 pub const n_min = 2;
 
-/// Round counts for ALF-n-t: [t == 0, t > 0] indexed by n - 2.
+/// Round counts, for t == 0 and for t > 0.
 pub const rounds = [n_count][2]u8{
     .{ 20, 28 }, // n = 2
     .{ 16, 24 }, // n = 3
@@ -170,9 +166,8 @@ pub const rho = [n_count]Vec{
     .{ 0, -1, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, 0, -1 },
 };
 
-/// Compensation constant A_n that cancels the effect of SubBytes on the zero
-/// bytes injected by the alpha shuffle. Stored as raw bytes; values that look
-/// negative in the spec (-91, -58) wrap modulo 256 (0xa5, 0xc6).
+/// Constant used when turning encryption keys into decryption keys.
+/// The paper prints some of these bytes as negative numbers: -91 is 0xa5 and -58 is 0xc6.
 pub const const_a = [n_count][16]u8{
     .{ 99, 99, 82, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, // n=2
     .{ 0xa5, 0xa5, 99, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, // n=3
@@ -190,7 +185,7 @@ pub const const_a = [n_count][16]u8{
     .{ 0, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99, 99, 0xa5, 0xc6 }, // n=15
 };
 
-/// Parity compensation byte B for decryption: 0x52 when n mod 4 == 3, else 0.
+/// Byte that corrects the extra bits during decryption.
 pub fn parityCompensation(n: u8) u8 {
     return if (n % 4 == 3) 0x52 else 0;
 }
