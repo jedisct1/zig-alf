@@ -4,21 +4,22 @@
 //! Each vector starts from zero and gives the result after 1, 5 and 999 encryptions.
 
 const std = @import("std");
+const fmt = std.fmt;
+const mem = std.mem;
 const testing = std.testing;
-const alf = @import("root.zig");
 
-const ktm = alf.ktm;
-const alf_l = alf.alf_l;
-const Cipher = alf.alf_int.Cipher;
+const ktm = @import("ktm.zig");
+const Alf = @import("alf_int.zig").Alf;
+const AlfL = @import("alf_l.zig").AlfL;
 
 const vectors = @embedFile("testdata/testvec.hpp");
 
 const ref_app_id: u64 = 0xf1f2f3f4f5f6f7f8;
-const ref_key = [16]u8{ 0x05, 0x0a, 0x0f, 0x14, 0x19, 0x1e, 0x23, 0x28, 0x2d, 0x32, 0x37, 0x3c, 0x41, 0x46, 0x4b, 0x50 };
-const ref_tweak = [16]u8{ 0x0b, 0x16, 0x21, 0x2c, 0x37, 0x42, 0x4d, 0x58, 0x63, 0x6e, 0x79, 0x84, 0x8f, 0x9a, 0xa5, 0xb0 };
+const ref_key = [Alf.key_length]u8{ 0x05, 0x0a, 0x0f, 0x14, 0x19, 0x1e, 0x23, 0x28, 0x2d, 0x32, 0x37, 0x3c, 0x41, 0x46, 0x4b, 0x50 };
+const ref_tweak = [Alf.tweak_length]u8{ 0x0b, 0x16, 0x21, 0x2c, 0x37, 0x42, 0x4d, 0x58, 0x63, 0x6e, 0x79, 0x84, 0x8f, 0x9a, 0xa5, 0xb0 };
 
-/// Moduli of the D vectors, each minus one.
-/// A vector of length N uses the last N entries.
+// Moduli of the D vectors, each minus one.
+// A vector of length N uses the last N entries.
 const ref_q_max = [128]u16{
     0x0008, 0x0004, 0x0001, 0x0000, 0x0003, 0x000e, 0x0029, 0x0064, 0x00df, 0x01da, 0x03d5, 0x07d0, 0x0fcb, 0x1fc6, 0x3fc1, 0x7fbc,
     0x0005, 0x0000, 0xfffc, 0xfffa, 0xfffc, 0x0006, 0x0020, 0x005a, 0x00d4, 0x01ce, 0x03c8, 0x07c2, 0x0fbc, 0x1fb6, 0x3fb0, 0x7faa,
@@ -48,8 +49,8 @@ const Kind = enum(u8) {
     /// C: the use cases listed in the paper.
     use_case,
 
-    fn letter(self: Kind) u8 {
-        return "TSDC"[@backingInt(self)];
+    fn letter(kind: Kind) u8 {
+        return "TSDC"[@backingInt(kind)];
     }
 };
 
@@ -69,13 +70,13 @@ const Vector = struct {
     const no_offset = 0xffff;
 
     fn parse(line: []const u8) !Vector {
-        const body = line[std.mem.indexOf(u8, line, "*/").? + 2 ..];
-        var tokens = std.mem.tokenizeAny(u8, body, " {},\r\t");
+        const body = line[mem.indexOf(u8, line, "*/").? + 2 ..];
+        var tokens = mem.tokenizeAny(u8, body, " {},\r\t");
         var fields: [field_count]u64 = undefined;
         var count: usize = 0;
         while (tokens.next()) |raw| : (count += 1) {
             if (count == fields.len) return error.MalformedVector;
-            fields[count] = try std.fmt.parseInt(u64, std.mem.trimEnd(u8, raw, "UL"), 0);
+            fields[count] = try fmt.parseInt(u64, mem.trimEnd(u8, raw, "UL"), 0);
         }
         if (count != fields.len) return error.MalformedVector;
 
@@ -95,19 +96,19 @@ const Vector = struct {
         return v;
     }
 
-    fn moduli(self: Vector) alf_l.Moduli {
-        if (self.q_offset == no_offset) return .{ .same = self.q_same_max +% 1 };
-        return .{ .distinct = ref_moduli[self.q_offset..][0..self.n] };
+    fn moduli(vector: Vector) AlfL.Moduli {
+        if (vector.q_offset == no_offset) return .{ .same = vector.q_same_max +% 1 };
+        return .{ .distinct = ref_moduli[vector.q_offset..][0..vector.n] };
     }
 
-    fn expectEqual(self: Vector, what: []const u8, expected: []const u8, actual: []const u8) !void {
-        if (std.mem.eql(u8, expected, actual)) return;
-        std.debug.print("vector {c}{d}: wrong {s}\n", .{ self.kind.letter(), self.idx, what });
+    fn expectEqual(vector: Vector, what: []const u8, expected: []const u8, actual: []const u8) !void {
+        if (mem.eql(u8, expected, actual)) return;
+        std.debug.print("vector {c}{d}: wrong {s}\n", .{ vector.kind.letter(), vector.idx, what });
         return testing.expectEqualSlices(u8, expected, actual);
     }
 
-    /// Check the result of the given iteration, if the vector records it.
-    fn expectSnapshot(self: Vector, iteration: usize, actual: [32]u8) !void {
+    // Checks the result of the given iteration, if the vector records it.
+    fn expectSnapshot(vector: Vector, iteration: usize, actual: [32]u8) !void {
         const index: usize = switch (iteration) {
             1 => 0,
             5 => 1,
@@ -115,39 +116,40 @@ const Vector = struct {
             else => return,
         };
         var name: [16]u8 = undefined;
-        const what = std.fmt.bufPrint(&name, "Enc^{d}(0)", .{iteration}) catch unreachable;
-        try self.expectEqual(what, &self.enc[index], &actual);
+        const what = fmt.bufPrint(&name, "Enc^{d}(0)", .{iteration}) catch unreachable;
+        try vector.expectEqual(what, &vector.enc[index], &actual);
     }
 };
 
 const VectorIterator = struct {
-    lines: std.mem.SplitIterator(u8, .scalar) = std.mem.splitScalar(u8, vectors, '\n'),
+    lines: mem.SplitIterator(u8, .scalar) = mem.splitScalar(u8, vectors, '\n'),
 
-    fn next(self: *VectorIterator) !?Vector {
-        while (self.lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "/*[")) return try Vector.parse(line);
+    fn next(it: *VectorIterator) !?Vector {
+        while (it.lines.next()) |line| {
+            if (mem.startsWith(u8, line, "/*[")) return try Vector.parse(line);
         }
         return null;
     }
 };
 
-/// The key material a vector records:
-/// the start of the S-box for ALF-0, the first round keys for the others.
-fn material(cipher: *const Cipher, comptime side: enum { enc, dec }) [64]u8 {
+// Returns the key material a vector records:
+// the start of the S-box for ALF-0, the first round keys for the others.
+fn material(alf: *const Alf, comptime side: enum { enc, dec }) [64]u8 {
     var out: [64]u8 = @splat(0);
-    switch (cipher.*) {
-        .alf0 => |*c| {
-            const len = @min(c.q, 16);
-            const table = if (side == .enc) &c.enc_table else &c.dec_table;
+    switch (alf.*) {
+        .alf_0 => |*variant| {
+            const len = @min(variant.q, 16);
+            const table = if (side == .enc) &variant.enc_table else &variant.dec_table;
             @memcpy(out[0..len], table[0..len]);
         },
-        .alf1t => |*c| out[0..16].* = c.round_keys[0..16].*,
-        .alfnt => |*c| {
-            const keys = if (side == .enc) &c.enc_keys else &c.dec_keys;
-            for (0..4) |r| @memcpy(out[16 * r ..][0..c.n], keys[r].toBytes()[0..c.n]);
+        .alf_1t => |*variant| out[0..16].* = variant.round_keys[0..16].*,
+        .alf_nt => |*variant| {
+            const n = variant.shape.n;
+            const keys = if (side == .enc) &variant.enc_keys else &variant.dec_keys;
+            for (0..4) |r| @memcpy(out[16 * r ..][0..n], keys[r].toBytes()[0..n]);
         },
-        .alf16t => |*c| {
-            const keys = if (side == .enc) &c.enc_keys else &c.dec_keys;
+        .alf_16t => |*variant| {
+            const keys = if (side == .enc) &variant.enc_keys else &variant.dec_keys;
             for (0..4) |r| out[16 * r ..][0..16].* = keys[r].toBytes();
         },
     }
@@ -156,18 +158,18 @@ fn material(cipher: *const Cipher, comptime side: enum { enc, dec }) [64]u8 {
 
 fn integerSnapshot(x: u160) [32]u8 {
     var out: [32]u8 = @splat(0);
-    std.mem.writeInt(u192, out[0..24], x, .little);
+    mem.writeInt(u192, out[0..24], x, .little);
     return out;
 }
 
-/// Vectors only record the first 16 symbols.
+// Vectors only record the first 16 symbols.
 fn symbolSnapshot(symbols: []const u16) [32]u8 {
     var out: [32]u8 = @splat(0);
-    for (symbols[0..@min(symbols.len, 16)], 0..) |s, i| std.mem.writeInt(u16, out[2 * i ..][0..2], s, .little);
+    for (symbols[0..@min(symbols.len, 16)], 0..) |symbol, i| mem.writeInt(u16, out[2 * i ..][0..2], symbol, .little);
     return out;
 }
 
-test "single integers (T vectors)" {
+test "Alf - single integers (T vectors)" {
     var it: VectorIterator = .{};
     var count: usize = 0;
     while (try it.next()) |v| {
@@ -175,19 +177,19 @@ test "single integers (T vectors)" {
         count += 1;
 
         const q: u160 = @intCast(v.q_max + 1);
-        const state = ktm.keyInit(ref_key, ref_app_id, .{ .integer = q });
+        const state: ktm.State = .init(ref_key, ref_app_id, .{ .integer = q });
         try v.expectEqual("KeyInit state", &v.key_state, &state.toBytes());
 
-        const cipher: Cipher = try .init(ref_key, ref_tweak, ref_app_id, q);
-        try v.expectEqual("encryption keys", &v.enc_material, &material(&cipher, .enc));
-        try v.expectEqual("decryption keys", &v.dec_material, &material(&cipher, .dec));
+        const alf: Alf = try .init(ref_key, ref_tweak, ref_app_id, q);
+        try v.expectEqual("encryption keys", &v.enc_material, &material(&alf, .enc));
+        try v.expectEqual("decryption keys", &v.dec_material, &material(&alf, .dec));
 
         var x: u160 = 0;
         for (1..iterations + 1) |i| {
-            x = try cipher.encrypt(x);
+            x = try alf.encrypt(x);
             try v.expectSnapshot(i, integerSnapshot(x));
         }
-        for (0..iterations) |_| x = try cipher.decrypt(x);
+        for (0..iterations) |_| x = try alf.decrypt(x);
         try testing.expectEqual(0, x);
     }
     try testing.expectEqual(68, count);
@@ -207,11 +209,11 @@ fn expectVectorKind(kind: Kind, expected_count: usize) !void {
         @memset(symbols, 0);
 
         for (1..iterations + 1) |i| {
-            try alf_l.encrypt(ref_key, ref_tweak, ref_app_id, moduli, symbols, symbols);
+            try AlfL.encrypt(symbols, symbols, moduli, ref_app_id, ref_tweak, ref_key);
             try v.expectSnapshot(i, symbolSnapshot(symbols));
         }
-        for (0..iterations) |_| try alf_l.decrypt(ref_key, ref_tweak, ref_app_id, moduli, symbols, symbols);
-        if (!std.mem.allEqual(u16, symbols, 0)) {
+        for (0..iterations) |_| try AlfL.decrypt(symbols, symbols, moduli, ref_app_id, ref_tweak, ref_key);
+        if (!mem.allEqual(u16, symbols, 0)) {
             std.debug.print("vector {c}{d}: decryption does not lead back to zero\n", .{ v.kind.letter(), v.idx });
             return error.TestExpectedEqual;
         }
@@ -219,19 +221,19 @@ fn expectVectorKind(kind: Kind, expected_count: usize) !void {
     try testing.expectEqual(expected_count, count);
 }
 
-test "symbols with the same modulus (S vectors)" {
+test "AlfL - symbols with the same modulus (S vectors)" {
     try expectVectorKind(.same, 31);
 }
 
-test "symbols with distinct moduli (D vectors)" {
+test "AlfL - symbols with distinct moduli (D vectors)" {
     try expectVectorKind(.distinct, 127);
 }
 
-test "use cases of the paper (C vectors)" {
+test "AlfL - use cases of the paper (C vectors)" {
     try expectVectorKind(.use_case, 7);
 }
 
-test "a vector of one symbol is encrypted like a single integer" {
+test "AlfL - a vector of one symbol is encrypted like a single integer" {
     var it: VectorIterator = .{};
     var count: usize = 0;
     while (try it.next()) |v| {
@@ -239,10 +241,10 @@ test "a vector of one symbol is encrypted like a single integer" {
         count += 1;
 
         const q: u16 = @truncate(v.q_max + 1);
-        for ([_]alf_l.Moduli{ .{ .same = q }, .{ .distinct = &.{q} } }) |moduli| {
+        for ([_]AlfL.Moduli{ .{ .same = q }, .{ .distinct = &.{q} } }) |moduli| {
             var symbol = [1]u16{0};
             for (1..iterations + 1) |i| {
-                try alf_l.encrypt(ref_key, ref_tweak, ref_app_id, moduli, &symbol, &symbol);
+                try AlfL.encrypt(&symbol, &symbol, moduli, ref_app_id, ref_tweak, ref_key);
                 try v.expectSnapshot(i, symbolSnapshot(&symbol));
             }
         }
